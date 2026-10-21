@@ -14,7 +14,12 @@
 
 Set other [`venice_parameters`](https://docs.venice.ai/api-reference/endpoint/chat/completions) per model in
 `~/.pi/agent/models.json`. They are merged with the default above, so the Venice system prompt stays
-off unless you set `include_venice_system_prompt: true`:
+off unless you set `include_venice_system_prompt: true`.
+
+Unlike other sampling parameters, `venice_parameters` merges key by key across the model's
+`samplingParams`, the thinking level's `samplingParamsByThinkingLevel` entry, and request-level
+`samplingParams`, with later layers winning per key. A thinking level can override a key but not
+remove it, so set an explicit value such as `"off"`:
 
 ```json
 {
@@ -22,7 +27,11 @@ off unless you set `include_venice_system_prompt: true`:
     "venice": {
       "modelOverrides": {
         "kimi-k3": {
-          "samplingParams": { "venice_parameters": { "enable_web_search": "auto" } }
+          "samplingParams": { "venice_parameters": { "enable_web_search": "auto" } },
+          "samplingParamsByThinkingLevel": {
+            "off": { "venice_parameters": { "enable_web_search": "off" } },
+            "high": { "venice_parameters": { "strip_thinking_response": true } }
+          }
         }
       }
     }

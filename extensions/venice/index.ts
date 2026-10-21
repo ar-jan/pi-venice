@@ -9,7 +9,14 @@
  *   (see request.ts).
  */
 
-import { type Api, createProvider, envApiKeyAuth, type Model, type ThinkingLevelMap } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	clampThinkingLevel,
+	createProvider,
+	envApiKeyAuth,
+	type Model,
+	type ThinkingLevelMap,
+} from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withVeniceRequestDefaults } from "./request.ts";
@@ -194,7 +201,7 @@ export default function (pi: ExtensionAPI) {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
 				return fetchVeniceModels(key, context.signal);
 			},
-			api: withVeniceRequestDefaults(openAICompletionsApi()),
+			api: withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel),
 		}),
 	);
 }

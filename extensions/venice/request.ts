@@ -1,21 +1,34 @@
 /**
  * Venice request defaults, applied to the final request body.
  *
- * Pi merges sampling parameters one level deep, so a `venice_parameters` object set by the user
- * (models.json overrides, per-thinking-level params, request params) would replace a default kept
- * in `Model.samplingParams`. Merging here, after pi has assembled the body, keeps user keys and the
- * default together.
+ * Pi merges sampling parameters one level deep: the last of the model's `samplingParams`, the
+ * thinking level's override, and the request's `samplingParams` that sets `venice_parameters`
+ * replaces it whole. Merging `venice_parameters` here, key by key and after pi has assembled the
+ * body, keeps the extension default and every user layer together.
  */
 
-import type { ProviderEnv, ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	Model,
+	ModelThinkingLevel,
+	ProviderEnv,
+	ProviderStreams,
+	SamplingParams,
+	StreamOptions,
+} from "@earendil-works/pi-ai";
 
 /** Venice keeps the first 64 characters, like OpenAI. */
 const PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+
+/** pi-ai's `clampThinkingLevel`, passed in so this module has no runtime dependencies. */
+export type ClampThinkingLevel = (model: Model<Api>, level: ModelThinkingLevel) => ModelThinkingLevel;
 
 export interface VeniceRequestContext {
 	sessionId?: string;
 	cacheRetention?: StreamOptions["cacheRetention"];
 	env?: ProviderEnv;
+	/** User `venice_parameters` values in pi's merge order: model, thinking level, request. */
+	veniceParameterLayers?: readonly unknown[];
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -38,8 +51,9 @@ function promptCacheKey(context: VeniceRequestContext): string | undefined {
 
 /**
  * Add Venice defaults to a chat completions body:
- * - `venice_parameters.include_venice_system_prompt: false` unless the body already sets it.
- *   Other `venice_parameters` keys are kept; a non-object value is left for Venice to reject.
+ * - `venice_parameters`: `include_venice_system_prompt: false`, then each user layer key by key,
+ *   then the body's own value, so later layers win per key. A non-object value in the body is left
+ *   for Venice to reject; non-object layers are skipped.
  * - `prompt_cache_key` from the session ID, so Venice routes the session to servers holding its
  *   cached prefix. Skipped when the body already has one or prompt caching is off.
  */
@@ -49,7 +63,11 @@ export function applyVeniceDefaults(payload: unknown, context: VeniceRequestCont
 
 	const veniceParameters = body.venice_parameters;
 	if (veniceParameters === undefined || isPlainObject(veniceParameters)) {
-		body = { ...body, venice_parameters: { include_venice_system_prompt: false, ...veniceParameters } };
+		const merged: Record<string, unknown> = { include_venice_system_prompt: false };
+		for (const layer of [...(context.veniceParameterLayers ?? []), veniceParameters]) {
+			if (isPlainObject(layer)) Object.assign(merged, layer);
+		}
+		body = { ...body, venice_parameters: merged };
 	}
 
 	const cacheKey = body.prompt_cache_key === undefined ? promptCacheKey(context) : undefined;
@@ -58,12 +76,26 @@ export function applyVeniceDefaults(payload: unknown, context: VeniceRequestCont
 	return body;
 }
 
-function withDefaults<T extends StreamOptions>(options: T | undefined): T {
+/** The `venice_parameters` of each layer pi merges, for the clamped thinking level. */
+function veniceParameterLayers(
+	model: Model<Api>,
+	level: ModelThinkingLevel,
+	requestParams: SamplingParams | undefined,
+	clamp: ClampThinkingLevel,
+): unknown[] {
+	return [
+		model.samplingParams?.venice_parameters,
+		model.samplingParamsByThinkingLevel?.[clamp(model, level)]?.venice_parameters,
+		requestParams?.venice_parameters,
+	];
+}
+
+function withDefaults<T extends StreamOptions>(options: T | undefined, layers: readonly unknown[]): T {
 	const callerOnPayload = options?.onPayload;
 	return {
 		...options,
 		onPayload: async (payload, model) => {
-			const prepared = applyVeniceDefaults(payload, options ?? {});
+			const prepared = applyVeniceDefaults(payload, { ...options, veniceParameterLayers: layers });
 			// Extension `before_provider_request` hooks arrive here and see the prepared body.
 			const replaced = await callerOnPayload?.(prepared, model);
 			return replaced === undefined ? prepared : replaced;
@@ -72,10 +104,18 @@ function withDefaults<T extends StreamOptions>(options: T | undefined): T {
 }
 
 /** Wrap an API implementation so every request through it gets the Venice defaults. */
-export function withVeniceRequestDefaults(api: ProviderStreams): ProviderStreams {
+export function withVeniceRequestDefaults(api: ProviderStreams, clamp: ClampThinkingLevel): ProviderStreams {
 	return {
 		...api,
-		stream: (model, context, options) => api.stream(model, context, withDefaults(options)),
-		streamSimple: (model, context, options) => api.streamSimple(model, context, withDefaults(options)),
+		stream: (model, context, options) => {
+			// The completions adapter reads `reasoningEffort`; pi uses "off" when it is unset.
+			const level = (options as { reasoningEffort?: ModelThinkingLevel } | undefined)?.reasoningEffort ?? "off";
+			const layers = veniceParameterLayers(model, level, options?.samplingParams, clamp);
+			return api.stream(model, context, withDefaults(options, layers));
+		},
+		streamSimple: (model, context, options) => {
+			const layers = veniceParameterLayers(model, options?.reasoning ?? "off", options?.samplingParams, clamp);
+			return api.streamSimple(model, context, withDefaults(options, layers));
+		},
 	};
 }

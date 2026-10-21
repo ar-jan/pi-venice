@@ -66,24 +66,45 @@ describe("applyVeniceDefaults", () => {
 });
 
 describe("withVeniceRequestDefaults", () => {
-	/** Fake API that builds a body the way pi does, then sends it through options.onPayload. */
-	function fakeApi(sent: unknown[], userBody: Record<string, unknown>): ProviderStreams {
-		const run = async (options?: StreamOptions) => {
-			const replaced = await options?.onPayload?.(userBody, {} as never);
-			sent.push(replaced === undefined ? userBody : replaced);
+	type Level = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	type FakeModel = {
+		samplingParams?: Record<string, unknown>;
+		samplingParamsByThinkingLevel?: Partial<Record<Level, Record<string, unknown>>>;
+	};
+
+	const identityClamp = (_model: unknown, level: Level) => level;
+
+	/**
+	 * Fake completions API: builds the body with pi's shallow merge (model, thinking level, request;
+	 * later wins per top-level key), then sends it through options.onPayload.
+	 */
+	function fakeApi(sent: unknown[], clamp: (model: never, level: Level) => Level = identityClamp): ProviderStreams {
+		const run = async (model: FakeModel, level: Level, options?: StreamOptions) => {
+			const params = {
+				...model.samplingParams,
+				...model.samplingParamsByThinkingLevel?.[clamp(model as never, level)],
+				...options?.samplingParams,
+			};
+			const built = { ...body(), ...params };
+			const replaced = await options?.onPayload?.(built, model as never);
+			sent.push(replaced === undefined ? built : replaced);
 		};
 		return {
-			stream: (_model, _context, options) => run(options) as never,
-			streamSimple: (_model, _context, options) => run(options) as never,
+			stream: (model, _context, options) =>
+				run(model as FakeModel, (options as { reasoningEffort?: Level })?.reasoningEffort ?? "off", options) as never,
+			streamSimple: (model, _context, options) => run(model as FakeModel, options?.reasoning ?? "off", options) as never,
 		};
 	}
+
+	const veniceParametersSent = (sent: unknown[]) => (sent[0] as Record<string, unknown>).venice_parameters;
 
 	it("applies defaults before the caller's onPayload, which can still replace the body", async () => {
 		const sent: unknown[] = [];
 		const seenByHook: unknown[] = [];
-		const api = withVeniceRequestDefaults(fakeApi(sent, body({ venice_parameters: { enable_web_search: "on" } })));
+		const model: FakeModel = { samplingParams: { venice_parameters: { enable_web_search: "on" } } };
+		const api = withVeniceRequestDefaults(fakeApi(sent), identityClamp);
 
-		await api.streamSimple({} as never, {} as never, {
+		await api.streamSimple(model as never, {} as never, {
 			sessionId: "session-1",
 			onPayload: (payload) => {
 				seenByHook.push(payload);
@@ -102,7 +123,54 @@ describe("withVeniceRequestDefaults", () => {
 
 	it("applies defaults when the caller has no onPayload", async () => {
 		const sent: unknown[] = [];
-		await withVeniceRequestDefaults(fakeApi(sent, body())).stream({} as never, {} as never, undefined);
+		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).stream({} as never, {} as never, undefined);
 		assert.deepEqual(sent, [{ ...body(), venice_parameters: { include_venice_system_prompt: false } }]);
+	});
+
+	it("merges model, thinking-level, and request venice_parameters key by key", async () => {
+		const sent: unknown[] = [];
+		const model: FakeModel = {
+			samplingParams: { venice_parameters: { enable_web_search: "on", strip_thinking_response: false } },
+			samplingParamsByThinkingLevel: { high: { venice_parameters: { strip_thinking_response: true } } },
+		};
+		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {
+			reasoning: "high",
+			samplingParams: { venice_parameters: { enable_web_citations: true } },
+		});
+		assert.deepEqual(veniceParametersSent(sent), {
+			include_venice_system_prompt: false,
+			enable_web_search: "on",
+			strip_thinking_response: true,
+			enable_web_citations: true,
+		});
+	});
+
+	it("lets a later layer override a key, including the default", async () => {
+		const sent: unknown[] = [];
+		const model: FakeModel = {
+			samplingParams: { venice_parameters: { enable_web_search: "on" } },
+			samplingParamsByThinkingLevel: {
+				off: { venice_parameters: { enable_web_search: "off", include_venice_system_prompt: true } },
+			},
+		};
+		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {});
+		assert.deepEqual(veniceParametersSent(sent), { include_venice_system_prompt: true, enable_web_search: "off" });
+	});
+
+	it("uses the clamped thinking level and reasoningEffort on the stream path", async () => {
+		const sent: unknown[] = [];
+		const clamp = (_model: unknown, level: Level): Level => (level === "medium" ? "high" : level);
+		const model: FakeModel = {
+			samplingParams: { venice_parameters: { enable_web_search: "on" } },
+			samplingParamsByThinkingLevel: { high: { venice_parameters: { strip_thinking_response: true } } },
+		};
+		await withVeniceRequestDefaults(fakeApi(sent, clamp), clamp).stream(model as never, {} as never, {
+			reasoningEffort: "medium",
+		} as StreamOptions);
+		assert.deepEqual(veniceParametersSent(sent), {
+			include_venice_system_prompt: false,
+			enable_web_search: "on",
+			strip_thinking_response: true,
+		});
 	});
 });
