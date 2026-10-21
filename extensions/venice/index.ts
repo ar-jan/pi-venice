@@ -17,7 +17,12 @@ import {
 	type Model,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+// Pi's extension loader maps only a fixed set of pi-ai specifiers onto the host
+// package (root, /compat, /oauth, /providers/all). Installed extensions have no
+// node_modules, so the per-API modules ("@earendil-works/pi-ai/api/*") cannot be
+// resolved here and fail at load time. Keep the compat import until pi exposes a
+// stable entry point for API implementations.
+import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withVeniceRequestDefaults } from "./request.ts";
 
