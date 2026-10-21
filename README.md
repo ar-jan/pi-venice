@@ -2,9 +2,28 @@
 
 [Venice AI](https://venice.ai) provider for [Pi](https://github.com/earendil-works/pi).
 
-- **Auth:** `/login venice` (stored in `auth.json`) or the `VENICE_API_KEY` environment variable.
-- **Models:** fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
-  support tool calling, and cached in `models-store.json`.
+## Install
+
+```bash
+pi install git:github.com/ar-jan/pi-venice
+```
+
+## Auth
+
+`/login venice` (stored in `auth.json`), or via the `VENICE_API_KEY` environment variable.
+
+## Update
+
+```bash
+pi update git:github.com/ar-jan/pi-venice
+```
+
+Then run `/reload` in Pi (or start a new session).
+
+## Features
+
+- Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
+support tool calling, and cached in `models-store.json`.
 - Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
   prefix (omitted when prompt caching is set to `none`).
@@ -38,20 +57,6 @@ remove it, so set an explicit value such as `"off"`:
   }
 }
 ```
-
-## Install
-
-```bash
-pi install git:github.com/ar-jan/pi-venice
-```
-
-# Update
-
-```bash
-pi update git:github.com/ar-jan/pi-venice
-```
-
-Then run `/reload` in Pi (or start a new session).
 
 ## Development
 
