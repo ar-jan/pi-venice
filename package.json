@@ -3,15 +3,22 @@
   "version": "0.1.0",
   "description": "Venice AI provider for Pi",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "pi": {
-    "extensions": ["./extensions/venice/index.ts"]
+    "extensions": [
+      "./extensions/venice/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5"
   }
 }
