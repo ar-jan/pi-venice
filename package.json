@@ -4,6 +4,9 @@
   "description": "Venice AI provider for Pi",
   "type": "module",
   "keywords": ["pi-package"],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
   "pi": {
     "extensions": ["./extensions/venice/index.ts"]
   },

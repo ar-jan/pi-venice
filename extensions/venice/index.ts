@@ -5,11 +5,14 @@
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
  *   support tool calling, and cached in models-store.json for offline use.
  * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier.
+ * - Requests disable Venice's own system prompt and carry a per-session `prompt_cache_key`
+ *   (see request.ts).
  */
 
 import { type Api, createProvider, envApiKeyAuth, type Model, type ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
 const BASE_URL = "https://api.venice.ai/api/v1";
@@ -146,8 +149,6 @@ function toPiModel(model: VeniceModel): Model<"openai-completions"> | undefined 
 		...(pricing.cache_input ? { promptCache: { short: 300 } } : {}),
 		contextWindow: spec.availableContextTokens ?? 128_000,
 		maxTokens: spec.maxCompletionTokens ?? 16_384,
-		// Merged into every request body. Venice otherwise prepends its own system prompt.
-		samplingParams: { venice_parameters: { include_venice_system_prompt: false } },
 		compat: {
 			thinkingFormat: "openai",
 			supportsReasoningEffort: thinking.supportsReasoningEffort,
@@ -193,19 +194,7 @@ export default function (pi: ExtensionAPI) {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
 				return fetchVeniceModels(key, context.signal);
 			},
-			api: openAICompletionsApi(),
+			api: withVeniceRequestDefaults(openAICompletionsApi()),
 		}),
 	);
-
-	// Venice routes requests with the same prompt_cache_key to servers that already hold the cached prefix.
-	pi.on("before_provider_request", (event, ctx) => {
-		if (ctx.model?.provider !== PROVIDER_ID) return;
-		const payload = event.payload;
-		if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return;
-		const body = payload as Record<string, unknown>;
-		if (body.model !== ctx.model.id || !Array.isArray(body.messages) || body.prompt_cache_key !== undefined) return;
-		const sessionId = ctx.sessionManager.getSessionId();
-		if (!sessionId) return;
-		return { ...body, prompt_cache_key: sessionId.slice(0, 64) };
-	});
 }
