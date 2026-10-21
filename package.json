@@ -1,0 +1,14 @@
+{
+  "name": "pi-venice",
+  "version": "0.1.0",
+  "description": "Venice AI provider for Pi",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/venice/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
