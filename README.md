@@ -28,6 +28,10 @@ support tool calling and do not require end-to-end encryption (E2EE), and cached
 - Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
   prefix (omitted when prompt caching is set to `none`).
+- Venice reports cache writes as `cache_creation_input_tokens`, which Pi's OpenAI-completions adapter
+  does not read. The streamed usage is corrected before Pi sees it: written tokens move from `input`
+  to `cacheWrite` and the cost is recomputed, so cache reads and Claude's cache-write premium are
+  reported accurately.
 - Venice's own system prompt is disabled (`venice_parameters.include_venice_system_prompt: false`).
 - Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on a
   short list of models verified to honor `venice_parameters.disable_thinking` (see [Thinking](#thinking)).

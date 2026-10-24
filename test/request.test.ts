@@ -1,9 +1,47 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import type { ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	AssistantMessageEventStream,
+	ProviderStreams,
+	SimpleStreamOptions,
+	StreamOptions,
+	Usage,
+} from "@earendil-works/pi-ai";
 import { applyVeniceDefaults, withVeniceRequestDefaults } from "../extensions/venice/request.ts";
 
 const body = (extra: Record<string, unknown> = {}) => ({ model: "kimi-k3", messages: [], ...extra });
+
+const zeroUsage = (): Usage => ({
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+});
+
+const assistant = (usage: Usage = zeroUsage()): AssistantMessage => ({
+	role: "assistant",
+	content: [],
+	api: "fake",
+	provider: "fake",
+	model: "fake",
+	usage,
+	stopReason: "stop",
+	timestamp: Date.now(),
+});
+
+/** Consume a provider stream the way pi does, returning the final message. */
+async function drain(stream: AssistantMessageEventStream): Promise<AssistantMessage | undefined> {
+	for await (const _event of stream) {
+		// drain
+	}
+	return await stream.result();
+}
+
+const near = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-12, `${actual} != ${expected}`);
 
 describe("applyVeniceDefaults", () => {
 	const savedRetention = process.env.PI_CACHE_RETENTION;
@@ -91,12 +129,26 @@ describe("withVeniceRequestDefaults", () => {
 			const replaced = await options?.onPayload?.(built, model as never);
 			sent.push(replaced === undefined ? built : replaced);
 		};
+		const streaming = (run: Promise<void>): AssistantMessageEventStream => {
+			const stream = createAssistantMessageEventStream();
+			void run.then(() => {
+				stream.push({ type: "done", reason: "stop", message: assistant() });
+				stream.end();
+			});
+			return stream;
+		};
 		return {
 			stream: (model, _context, options) =>
-				run(model as FakeModel, (options as { reasoningEffort?: Level })?.reasoningEffort ?? "off", options) as never,
-			streamSimple: (model, _context, options) => run(model as FakeModel, options?.reasoning ?? "off", options) as never,
+				streaming(run(model as FakeModel, (options as { reasoningEffort?: Level })?.reasoningEffort ?? "off", options)),
+			streamSimple: (model, _context, options) =>
+				streaming(run(model as FakeModel, options?.reasoning ?? "off", options)),
 		};
 	}
+
+	const streamCall = (api: ProviderStreams, model: FakeModel, options?: StreamOptions) =>
+		drain(api.stream(model as never, {} as never, options));
+	const simpleCall = (api: ProviderStreams, model: FakeModel, options?: SimpleStreamOptions) =>
+		drain(api.streamSimple(model as never, {} as never, options));
 
 	const veniceParametersSent = (sent: unknown[]) => (sent[0] as Record<string, unknown>).venice_parameters;
 
@@ -106,7 +158,7 @@ describe("withVeniceRequestDefaults", () => {
 		const model: FakeModel = { samplingParams: { venice_parameters: { enable_web_search: "on" } } };
 		const api = withVeniceRequestDefaults(fakeApi(sent), identityClamp);
 
-		await api.streamSimple(model as never, {} as never, {
+		await simpleCall(api, model, {
 			sessionId: "session-1",
 			onPayload: (payload) => {
 				seenByHook.push(payload);
@@ -125,7 +177,7 @@ describe("withVeniceRequestDefaults", () => {
 
 	it("applies defaults when the caller has no onPayload", async () => {
 		const sent: unknown[] = [];
-		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).stream({} as never, {} as never, undefined);
+		await streamCall(withVeniceRequestDefaults(fakeApi(sent), identityClamp), {});
 		assert.deepEqual(sent, [{ ...body(), venice_parameters: { include_venice_system_prompt: false } }]);
 	});
 
@@ -135,7 +187,7 @@ describe("withVeniceRequestDefaults", () => {
 			samplingParams: { venice_parameters: { enable_web_search: "on", strip_thinking_response: false } },
 			samplingParamsByThinkingLevel: { high: { venice_parameters: { strip_thinking_response: true } } },
 		};
-		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {
+		await simpleCall(withVeniceRequestDefaults(fakeApi(sent), identityClamp), model, {
 			reasoning: "high",
 			samplingParams: { venice_parameters: { enable_web_citations: true } },
 		});
@@ -155,7 +207,7 @@ describe("withVeniceRequestDefaults", () => {
 				off: { venice_parameters: { enable_web_search: "off", include_venice_system_prompt: true } },
 			},
 		};
-		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {});
+		await simpleCall(withVeniceRequestDefaults(fakeApi(sent), identityClamp), model, {});
 		assert.deepEqual(veniceParametersSent(sent), { include_venice_system_prompt: true, enable_web_search: "off" });
 	});
 
@@ -166,7 +218,7 @@ describe("withVeniceRequestDefaults", () => {
 			samplingParams: { venice_parameters: { enable_web_search: "on" } },
 			samplingParamsByThinkingLevel: { high: { venice_parameters: { strip_thinking_response: true } } },
 		};
-		await withVeniceRequestDefaults(fakeApi(sent, clamp), clamp).stream(model as never, {} as never, {
+		await streamCall(withVeniceRequestDefaults(fakeApi(sent, clamp), clamp), model, {
 			reasoningEffort: "medium",
 		} as StreamOptions);
 		assert.deepEqual(veniceParametersSent(sent), {
@@ -181,8 +233,8 @@ describe("withVeniceRequestDefaults", () => {
 		const model: FakeModel = { reasoning: true, thinkingLevelMap: { off: undefined } };
 		const api = withVeniceRequestDefaults(fakeApi(sent), identityClamp);
 
-		await api.streamSimple(model as never, {} as never, {});
-		await api.stream(model as never, {} as never, undefined);
+		await simpleCall(api, model, {});
+		await streamCall(api, model);
 
 		assert.deepEqual(veniceParametersSent(sent), {
 			include_venice_system_prompt: false,
@@ -193,7 +245,7 @@ describe("withVeniceRequestDefaults", () => {
 	it("leaves thinking to reasoning_effort where off maps to none", async () => {
 		const sent: unknown[] = [];
 		const model: FakeModel = { reasoning: true, thinkingLevelMap: { off: "none" } };
-		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {});
+		await simpleCall(withVeniceRequestDefaults(fakeApi(sent), identityClamp), model, {});
 		assert.deepEqual(veniceParametersSent(sent), { include_venice_system_prompt: false });
 	});
 
@@ -201,8 +253,8 @@ describe("withVeniceRequestDefaults", () => {
 		const sent: unknown[] = [];
 		const api = withVeniceRequestDefaults(fakeApi(sent), identityClamp);
 
-		await api.streamSimple({ reasoning: true } as never, {} as never, { reasoning: "high" });
-		await api.streamSimple({ reasoning: false } as never, {} as never, {});
+		await simpleCall(api, { reasoning: true }, { reasoning: "high" });
+		await simpleCall(api, { reasoning: false }, {});
 
 		for (const body of sent) assert.equal("disable_thinking" in (veniceParametersSent([body]) as object), false);
 	});
@@ -213,7 +265,7 @@ describe("withVeniceRequestDefaults", () => {
 			reasoning: true,
 			samplingParamsByThinkingLevel: { off: { venice_parameters: { disable_thinking: false } } },
 		};
-		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {});
+		await simpleCall(withVeniceRequestDefaults(fakeApi(sent), identityClamp), model, {});
 		assert.deepEqual(veniceParametersSent(sent), {
 			include_venice_system_prompt: false,
 			disable_thinking: false,
@@ -229,9 +281,102 @@ describe("withVeniceRequestDefaults", () => {
 			reasoning: true,
 			samplingParamsByThinkingLevel: { off: { venice_parameters: { disable_thinking: false } } },
 		};
-		await withVeniceRequestDefaults(fakeApi(sent, clamp), clamp).stream(model as never, {} as never, {
+		await streamCall(withVeniceRequestDefaults(fakeApi(sent, clamp), clamp), model, {
 			reasoningEffort: "high",
 		} as StreamOptions);
 		assert.equal((veniceParametersSent(sent) as Record<string, unknown>).disable_thinking, false);
+	});
+});
+
+describe("cache write usage", () => {
+	const model = {
+		id: "claude-opus-5-5",
+		api: "openai-completions",
+		provider: "venice",
+		cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+	};
+	const clamp = ((_model: unknown, level: unknown) => level) as never;
+
+	/**
+	 * Minimal completions adapter: hands the raw usage chunk to `onProviderStreamEvent`, then ends
+	 * with the message the adapter's own `parseChunkUsage` would produce from it.
+	 */
+	function usageApi(rawChunk: unknown, parsed: Usage): ProviderStreams {
+		const run = (options?: StreamOptions) => {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				// The adapter prices the tokens it parsed, as `parseChunkUsage` does.
+				calculateCost(model as never, parsed);
+				const message = assistant(parsed);
+				stream.push({ type: "start", partial: { ...message, usage: zeroUsage(), stopReason: "pending" } });
+				await options?.onProviderStreamEvent?.(rawChunk, model as never);
+				stream.push({ type: "done", reason: "stop", message });
+				stream.end();
+			})();
+			return stream;
+		};
+		return {
+			stream: (_model, _context, options) => run(options),
+			streamSimple: (_model, _context, options) => run(options as StreamOptions),
+		};
+	}
+
+	const parsedUsage = (values: Partial<Usage>): Usage => ({
+		...zeroUsage(),
+		...values,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	});
+
+	it("moves Venice's cache_creation_input_tokens onto cacheWrite and recomputes the cost", async () => {
+		// Turn 1 measured against the live API: 15,637 prompt tokens, 15,621 written to cache.
+		const parsed = parsedUsage({ input: 15637, output: 4, totalTokens: 15641 });
+		const raw = {
+			usage: {
+				prompt_tokens: 15637,
+				completion_tokens: 4,
+				prompt_tokens_details: { cached_tokens: 0, cache_creation_input_tokens: 15621 },
+				cache_creation_input_tokens: 15621,
+			},
+		};
+		const message = await drain(withVeniceRequestDefaults(usageApi(raw, parsed), clamp).stream(model as never, {} as never));
+		assert.equal(message?.usage.input, 16);
+		assert.equal(message?.usage.cacheWrite, 15621);
+		assert.equal(message?.usage.totalTokens, 15641);
+		near(message!.usage.cost.input, (16 * 4) / 1e6);
+		near(message!.usage.cost.cacheWrite, (15621 * 5) / 1e6);
+		near(message!.usage.cost.total, (16 * 4 + 4 * 20 + 15621 * 5) / 1e6);
+	});
+
+	it("leaves cache reads alone when the turn only reads the cached prefix", async () => {
+		const parsed = parsedUsage({ input: 35, output: 7, cacheRead: 15621, totalTokens: 15663 });
+		const raw = { usage: { prompt_tokens: 15656, prompt_tokens_details: { cached_tokens: 15621 } } };
+		const message = await drain(withVeniceRequestDefaults(usageApi(raw, parsed), clamp).stream(model as never, {} as never));
+		assert.equal(message?.usage.input, 35);
+		assert.equal(message?.usage.cacheWrite, 0);
+		near(message!.usage.cost.cacheRead, (15621 * 0.2) / 1e6);
+	});
+
+	it("does not double count a provider that already reports cache_write_tokens", async () => {
+		const parsed = parsedUsage({ input: 9900, output: 1, cacheWrite: 100, totalTokens: 10001 });
+		const raw = {
+			usage: { prompt_tokens: 10000, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 100 } },
+		};
+		const message = await drain(withVeniceRequestDefaults(usageApi(raw, parsed), clamp).stream(model as never, {} as never));
+		assert.equal(message?.usage.input, 9900);
+		assert.equal(message?.usage.cacheWrite, 100);
+	});
+
+	it("still passes every provider chunk to the caller's onProviderStreamEvent", async () => {
+		const seen: unknown[] = [];
+		const raw = { usage: { prompt_tokens: 10, prompt_tokens_details: { cache_creation_input_tokens: 8 } } };
+		const parsed = parsedUsage({ input: 10, output: 1, totalTokens: 11 });
+		await drain(
+			withVeniceRequestDefaults(usageApi(raw, parsed), clamp).stream(model as never, {} as never, {
+				onProviderStreamEvent: (event) => {
+					seen.push(event);
+				},
+			}),
+		);
+		assert.deepEqual(seen, [raw]);
 	});
 });
