@@ -76,6 +76,11 @@ describe("toPiModel", () => {
 		assert.deepEqual(getSupportedThinkingLevels(model!), ["off", "high"]);
 	});
 
+	it("uses the developer role Venice supports on reasoning models", () => {
+		const model = toPiModel(veniceModel({ supportsReasoning: true }) as never);
+		assert.equal(model?.compat?.supportsDeveloperRole, true);
+	});
+
 	it("leaves non-reasoning models without a thinking level map", () => {
 		const model = toPiModel(veniceModel({ supportsReasoning: false }) as never);
 		assert.equal(model?.reasoning, false);

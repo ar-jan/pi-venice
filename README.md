@@ -26,6 +26,7 @@ Then run `/reload` in Pi (or start a new session).
 support tool calling and do not require end-to-end encryption (E2EE), and cached in
 `models-store.json`.
 - Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier.
+- Reasoning models send the system prompt with the OpenAI `developer` role, which Venice supports.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
   prefix (omitted when prompt caching is set to `none`).
 - Venice reports cache writes as `cache_creation_input_tokens`, which Pi's OpenAI-completions adapter

@@ -198,7 +198,9 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 			supportsReasoningEffort: thinking.supportsReasoningEffort,
 			maxTokensField: "max_completion_tokens",
 			supportsStore: false,
-			supportsDeveloperRole: false,
+			// Venice documents the developer message and honors it across catalog backends (Claude,
+			// OpenAI, Gemini, Qwen, DeepSeek, Kimi, Grok, ...).
+			supportsDeveloperRole: true,
 			supportsUsageInStreaming: true,
 			supportsLongCacheRetention: false,
 			supportsStrictMode: false,
