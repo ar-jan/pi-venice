@@ -25,6 +25,8 @@ Then run `/reload` in Pi (or start a new session).
 - Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
 support tool calling and do not require end-to-end encryption (E2EE), and cached in
 `models-store.json`.
+- Contradictory catalog limits (max output at or above the context window) are clamped so an
+  unknown output cap cannot consume the whole window; current Venice models are unaffected.
 - Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier.
 - Reasoning models send the system prompt with the OpenAI `developer` role, which Venice supports.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached

@@ -5,15 +5,19 @@ import { toPiModel } from "../extensions/venice/index.ts";
 
 type Capabilities = Record<string, unknown>;
 
-function veniceModel(capabilities: Capabilities = {}, id = "grok-4-20") {
+function veniceModel(
+	capabilities: Capabilities = {},
+	id = "grok-4-20",
+	limits: { contextWindow?: number; maxTokens?: number } = {},
+) {
 	return {
 		id,
 		type: "text",
 		model_spec: {
 			name: "Test Model",
 			privacy: "private",
-			availableContextTokens: 128_000,
-			maxCompletionTokens: 16_384,
+			availableContextTokens: limits.contextWindow ?? 128_000,
+			maxCompletionTokens: limits.maxTokens ?? 16_384,
 			capabilities: { supportsFunctionCalling: true, ...capabilities },
 			pricing: { input: { usd: 1 }, output: { usd: 2 } },
 		},
@@ -74,6 +78,21 @@ describe("toPiModel", () => {
 		);
 		assert.equal(model?.thinkingLevelMap?.off, "none");
 		assert.deepEqual(getSupportedThinkingLevels(model!), ["off", "high"]);
+	});
+
+	it("clamps a degenerate output cap instead of passing it through", () => {
+		const equal = toPiModel(veniceModel({}, "equal", { contextWindow: 128_000, maxTokens: 128_000 }) as never);
+		assert.equal(equal?.contextWindow, 128_000);
+		assert.equal(equal?.maxTokens, 32_000);
+
+		const above = toPiModel(veniceModel({}, "above", { contextWindow: 64_000, maxTokens: 128_000 }) as never);
+		assert.equal(above?.contextWindow, 64_000);
+		assert.equal(above?.maxTokens, 16_000);
+	});
+
+	it("keeps a large but valid output cap", () => {
+		const model = toPiModel(veniceModel({}, "large", { contextWindow: 500_000, maxTokens: 200_000 }) as never);
+		assert.equal(model?.maxTokens, 200_000);
 	});
 
 	it("uses the developer role Venice supports on reasoning models", () => {

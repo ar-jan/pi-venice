@@ -78,6 +78,25 @@ interface VeniceModel {
 
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+const DEFAULT_MAX_TOKENS = 16_384;
+
+// Catalogs sometimes publish an output cap equal to (or above) the context window when the real cap
+// is unknown. Taken at face value it asks for the whole window as output and leaves nothing for
+// input. Venice's live catalog is well formed (no model reaches even half its window), so this only
+// fires on bad data; keep at least three quarters of the window for input.
+const MAX_PLAUSIBLE_OUTPUT_TOKENS = 32_000;
+
+function modelLimits(spec: VeniceModel["model_spec"]): { contextWindow: number; maxTokens: number } {
+	const contextWindow = spec?.availableContextTokens ?? DEFAULT_CONTEXT_WINDOW;
+	const maxTokens = spec?.maxCompletionTokens ?? DEFAULT_MAX_TOKENS;
+	if (contextWindow <= 0 || maxTokens < contextWindow) return { contextWindow, maxTokens };
+	return {
+		contextWindow,
+		maxTokens: Math.min(MAX_PLAUSIBLE_OUTPUT_TOKENS, Math.max(1, Math.floor(contextWindow / 4))),
+	};
+}
+
 // Models that list no "none" effort but were verified against the live API to actually stop
 // reasoning when Venice is asked to disable thinking: with `venice_parameters.disable_thinking`
 // their completion tokens drop to the answer alone (or Venice reports reasoning_tokens 0).
@@ -158,6 +177,7 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 	const pricing = spec.pricing ?? {};
 	const extended = pricing.extended;
 	const thinking = thinkingConfig(model);
+	const { contextWindow, maxTokens } = modelLimits(spec);
 	const vision = caps.supportsVision === true;
 	const maxImages = caps.supportsMultipleImages === false ? 1 : caps.maxImages;
 
@@ -191,8 +211,8 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 		reasoning: thinking.reasoning,
 		...(thinking.thinkingLevelMap ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
 		...(pricing.cache_input ? { promptCache: { short: 300 } } : {}),
-		contextWindow: spec.availableContextTokens ?? 128_000,
-		maxTokens: spec.maxCompletionTokens ?? 16_384,
+		contextWindow,
+		maxTokens,
 		compat: {
 			thinkingFormat: "openai",
 			supportsReasoningEffort: thinking.supportsReasoningEffort,
