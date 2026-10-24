@@ -107,12 +107,15 @@ function usd(price: VenicePrice | undefined): number {
 	return typeof price?.usd === "number" ? price.usd : 0;
 }
 
-function toPiModel(model: VeniceModel): Model<"openai-completions"> | undefined {
+export function toPiModel(model: VeniceModel): Model<"openai-completions"> | undefined {
 	const spec = model.model_spec;
 	const caps = spec?.capabilities;
 	if (!spec || !caps) return undefined;
 	if (model.type !== undefined && model.type !== "text") return undefined;
 	if (!caps.supportsFunctionCalling || spec.offline) return undefined;
+	// E2EE models need client-side encryption that this provider does not implement, so they
+	// cannot serve requests from Pi even though they appear in the catalog.
+	if (caps.supportsE2EE) return undefined;
 
 	const now = Date.now();
 	const removesAt = spec.deprecation?.removesAt ?? spec.deprecation?.date;
@@ -120,7 +123,7 @@ function toPiModel(model: VeniceModel): Model<"openai-completions"> | undefined 
 
 	const privacy = spec.privacy === "private" ? "private" : "anonymized";
 	const tags: string[] = [privacy];
-	if (caps.supportsE2EE || caps.supportsTeeAttestation) tags.push("TEE");
+	if (caps.supportsTeeAttestation) tags.push("TEE");
 	if (removesAt) tags.push(`deprecated ${removesAt.slice(0, 10)}`);
 
 	const pricing = spec.pricing ?? {};

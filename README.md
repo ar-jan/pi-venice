@@ -23,7 +23,8 @@ Then run `/reload` in Pi (or start a new session).
 ## Features
 
 - Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
-support tool calling, and cached in `models-store.json`.
+support tool calling and do not require end-to-end encryption (E2EE), and cached in
+`models-store.json`.
 - Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
   prefix (omitted when prompt caching is set to `none`).
