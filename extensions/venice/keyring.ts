@@ -14,15 +14,29 @@
  * comes first, so key1 is used until Venice reports it exhausted.
  */
 
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
+	ApiKeyAuth,
+	ApiKeyCredential,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ProviderEnv,
 	ProviderStreams,
 } from "@earendil-works/pi-ai";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-export const FALLBACK_KEY_ENV = "VENICE_API_KEY_2";
+export const FALLBACK_KEY_PREFIX = "VENICE_API_KEY_";
+const FALLBACK_KEY_RE = /^VENICE_API_KEY_(\d+)$/;
+
+/** Indices are 2 and up: index 1 is the primary key's `VENICE_API_KEY`. */
+function fallbackIndex(name: string): number | undefined {
+	const match = FALLBACK_KEY_RE.exec(name);
+	if (!match) return undefined;
+	const index = Number(match[1]);
+	return index >= 2 ? index : undefined;
+}
 
 /**
  * Venice documents these 402 codes for a key that cannot pay for the request:
@@ -32,12 +46,92 @@ export const FALLBACK_KEY_ENV = "VENICE_API_KEY_2";
  */
 const BALANCE_FAILURE = /\b402\b|INSUFFICIENT_BALANCE|SPEND_LIMIT_EXCEEDED/i;
 
+/**
+ * Fallback keys in index order. A provider-scoped value (auth.json `env`) wins over the process
+ * environment for the same index; each value may be a comma- or whitespace-separated list.
+ */
 function fallbackKeys(env: ProviderEnv | undefined): string[] {
-	const raw = env?.[FALLBACK_KEY_ENV] ?? process.env[FALLBACK_KEY_ENV] ?? "";
-	return raw
-		.split(/[\s,]+/)
-		.map((key) => key.trim())
-		.filter((key) => key.length > 0);
+	const byIndex = new Map<number, string>();
+	for (const source of [env, process.env]) {
+		for (const [name, value] of Object.entries(source ?? {})) {
+			const index = fallbackIndex(name);
+			if (index !== undefined && typeof value === "string" && !byIndex.has(index)) byIndex.set(index, value);
+		}
+	}
+	return [...byIndex.entries()]
+		.sort(([a], [b]) => a - b)
+		.flatMap(([, value]) =>
+			value
+				.split(/[\s,]+/)
+				.map((key) => key.trim())
+				.filter((key) => key.length > 0),
+		);
+}
+
+/** The next free `VENICE_API_KEY_N` index, considering auth.json env and the process env. */
+export function nextFallbackIndex(env: ProviderEnv | undefined): number {
+	const used = new Set<number>();
+	for (const source of [env, process.env]) {
+		for (const name of Object.keys(source ?? {})) {
+			const index = fallbackIndex(name);
+			if (index !== undefined) used.add(index);
+		}
+	}
+	let index = 2;
+	while (used.has(index)) index++;
+	return index;
+}
+
+/** Read the credential `/login venice` previously stored, if any. */
+function readStoredCredential(): ApiKeyCredential | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(join(getAgentDir(), "auth.json"), "utf8")) as { venice?: ApiKeyCredential };
+		const credential = parsed.venice;
+		if (credential?.type === "api_key" && credential.key) return credential;
+	} catch {
+		// No readable auth.json: first-time login, or a store this extension cannot inspect.
+	}
+	return undefined;
+}
+
+/**
+ * Venice API-key auth whose login adds keys instead of replacing them.
+ *
+ * The first `/login venice` stores the primary key. Later runs append the entered key to the stored
+ * credential's `env` as the next `VENICE_API_KEY_N`, which the request wrapper uses as a fallback.
+ * When the primary comes from `VENICE_API_KEY` instead, a stored key would silently override that
+ * environment variable, so login explains the environment variable to set instead.
+ */
+export function veniceApiKeyAuth(): ApiKeyAuth {
+	const base = envApiKeyAuth("Venice API key", ["VENICE_API_KEY"]);
+	return {
+		...base,
+		login: async (interaction) => {
+			const stored = readStoredCredential();
+			if (stored) {
+				const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(stored.env)}`;
+				const key = await interaction.prompt({
+					type: "secret",
+					message: `Enter the fallback Venice API key to store as ${name}`,
+				});
+				interaction.signal.throwIfAborted();
+				interaction.notify({
+					type: "info",
+					message: `Stored as ${name} in auth.json. It is used after the stored key runs out; run /login venice again to add another key.`,
+				});
+				return { ...stored, env: { ...stored.env, [name]: key } };
+			}
+			if (process.env.VENICE_API_KEY) {
+				const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(undefined)}`;
+				throw new Error(
+					`VENICE_API_KEY is set, so Venice is configured from the environment and a stored key would override it. Add a fallback with: export ${name}=<key>`,
+				);
+			}
+			const key = await interaction.prompt({ type: "secret", message: "Enter Venice API key" });
+			interaction.signal.throwIfAborted();
+			return { type: "api_key", key };
+		},
+	};
 }
 
 /** Primary key first, then configured fallbacks, without duplicates. */

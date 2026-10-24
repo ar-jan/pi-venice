@@ -14,24 +14,31 @@ pi install git:github.com/ar-jan/pi-venice
 
 ## Key rotation
 
-A second (or third) key can take over when the current key runs out of credits. Put the extra keys
-in `VENICE_API_KEY_2`, comma- or whitespace-separated:
+A second (or third) key can take over when the current key runs out of credits.
+
+**Stored credential (recommended).** Run `/login venice` once to store the primary key. Running it
+again prompts for another key and stores it in `auth.json` under the credential's `env` as
+`VENICE_API_KEY_2`; further runs use `VENICE_API_KEY_3`, and so on. The stored primary stays first.
+To replace the primary key, run `/logout venice` and log in again.
+
+**Environment.** If the primary key comes from `VENICE_API_KEY`, `/login venice` explains which
+variable to export instead, because a stored key would override the environment. Add fallbacks with
+`VENICE_API_KEY_2`, `VENICE_API_KEY_3`, ... (each may also be a comma- or whitespace-separated list):
 
 ```bash
 export VENICE_API_KEY=key-1
 export VENICE_API_KEY_2=key-2
 ```
 
-The primary key is the `/login` credential or `VENICE_API_KEY`; fallbacks are appended in order and
-duplicates are dropped. Keys can also be stored in `auth.json` under the provider's `env` object
-(provider-scoped values take precedence over the process environment):
+Keys can also be edited directly in `auth.json` (provider-scoped values take precedence over the
+process environment):
 
 ```json
 {
   "venice": {
     "type": "api_key",
     "key": "key-1",
-    "env": { "VENICE_API_KEY_2": "key-2" }
+    "env": { "VENICE_API_KEY_2": "key-2", "VENICE_API_KEY_3": "key-3" }
   }
 }
 ```

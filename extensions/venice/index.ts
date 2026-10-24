@@ -2,6 +2,7 @@
  * Venice AI provider for Pi.
  *
  * - Auth: `/login venice` (stored in auth.json) or the VENICE_API_KEY environment variable.
+ *   Logging in again adds the next key as a fallback (VENICE_API_KEY_2, ...); see keyring.ts.
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
  *   support tool calling, and cached in models-store.json for offline use.
  * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier.
@@ -14,7 +15,6 @@ import {
 	type Api,
 	clampThinkingLevel,
 	createProvider,
-	envApiKeyAuth,
 	type Model,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
@@ -25,7 +25,7 @@ import {
 // stable entry point for API implementations.
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { withKeyRotation } from "./keyring.ts";
+import { withKeyRotation, veniceApiKeyAuth } from "./keyring.ts";
 import { withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
@@ -255,7 +255,7 @@ export default function (pi: ExtensionAPI) {
 			id: PROVIDER_ID,
 			name: "Venice AI",
 			baseUrl: BASE_URL,
-			auth: { apiKey: envApiKeyAuth("Venice API key", ["VENICE_API_KEY"]) },
+			auth: { apiKey: veniceApiKeyAuth() },
 			models: [],
 			fetchModels: (context) => {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;

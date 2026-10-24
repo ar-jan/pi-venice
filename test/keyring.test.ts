@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type {
+	ApiKeyCredential,
 	AssistantMessage,
 	AssistantMessageEventStream,
 	Model,
+	ProviderAuthInteraction,
 	ProviderStreams,
 	SimpleStreamOptions,
 	StreamOptions,
 } from "@earendil-works/pi-ai";
-import { candidateKeys, withKeyRotation } from "../extensions/venice/keyring.ts";
+import { candidateKeys, nextFallbackIndex, veniceApiKeyAuth, withKeyRotation } from "../extensions/venice/keyring.ts";
 
 const zeroUsage = () => ({
 	input: 0,
@@ -96,6 +101,7 @@ async function drain(stream: AssistantMessageEventStream): Promise<AssistantMess
 describe("candidateKeys", () => {
 	afterEach(() => {
 		delete process.env.VENICE_API_KEY_2;
+		delete process.env.VENICE_API_KEY_3;
 	});
 
 	it("uses the primary key alone when no fallback is configured", () => {
@@ -107,6 +113,16 @@ describe("candidateKeys", () => {
 			"key-1",
 			"key-2",
 			"key-3",
+		]);
+	});
+
+	it("orders numbered fallbacks and lets auth.json env win per index", () => {
+		process.env.VENICE_API_KEY_3 = "process-3";
+		process.env.VENICE_API_KEY_2 = "process-2";
+		assert.deepEqual(candidateKeys("key-1", { VENICE_API_KEY_2: "stored-2" }), [
+			"key-1",
+			"stored-2",
+			"process-3",
 		]);
 	});
 
@@ -198,5 +214,99 @@ describe("withKeyRotation", () => {
 
 		assert.deepEqual(api.calls, ["key-1", "key-2"]);
 		assert.equal(result.stopReason, "stop");
+	});
+});
+
+describe("veniceApiKeyAuth login", () => {
+	const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const savedPrimary = process.env.VENICE_API_KEY;
+	const tempDirs: string[] = [];
+
+	function useAuthFile(credential?: unknown): void {
+		const dir = mkdtempSync(join(tmpdir(), "pi-venice-auth-"));
+		tempDirs.push(dir);
+		process.env.PI_CODING_AGENT_DIR = dir;
+		if (credential !== undefined) writeFileSync(join(dir, "auth.json"), JSON.stringify(credential));
+	}
+
+	function interaction(answers: string[]): ProviderAuthInteraction & { prompts: string[]; notices: string[] } {
+		const prompts: string[] = [];
+		const notices: string[] = [];
+		return {
+			signal: new AbortController().signal,
+			prompts,
+			notices,
+			prompt: async (prompt) => {
+				prompts.push(prompt.message);
+				const answer = answers.shift();
+				if (answer === undefined) throw new Error("No answer prepared for prompt");
+				return answer;
+			},
+			notify: (event) => {
+				if (event.type === "info") notices.push(event.message);
+			},
+		};
+	}
+
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+		if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+		if (savedPrimary === undefined) delete process.env.VENICE_API_KEY;
+		else process.env.VENICE_API_KEY = savedPrimary;
+	});
+
+	it("stores the primary key on the first login", async () => {
+		useAuthFile();
+		delete process.env.VENICE_API_KEY;
+		const flow = interaction(["key-1"]);
+		const credential = await veniceApiKeyAuth().login!(flow);
+
+		assert.deepEqual(credential, { type: "api_key", key: "key-1" });
+		assert.deepEqual(flow.prompts, ["Enter Venice API key"]);
+	});
+
+	it("stores the second login as VENICE_API_KEY_2 and keeps the primary", async () => {
+		useAuthFile({ venice: { type: "api_key", key: "key-1", env: { EXISTING: "1" } } });
+		delete process.env.VENICE_API_KEY;
+		const flow = interaction(["key-2"]);
+		const credential = await veniceApiKeyAuth().login!(flow);
+
+		assert.deepEqual(credential, {
+			type: "api_key",
+			key: "key-1",
+			env: { EXISTING: "1", VENICE_API_KEY_2: "key-2" },
+		});
+		assert.match(flow.notices[0] ?? "", /VENICE_API_KEY_2/);
+	});
+
+	it("appends the next free numbered key", async () => {
+		useAuthFile({ venice: { type: "api_key", key: "key-1", env: { VENICE_API_KEY_2: "key-2" } } });
+		delete process.env.VENICE_API_KEY;
+		const flow = interaction(["key-3"]);
+		const credential = (await veniceApiKeyAuth().login!(flow)) as ApiKeyCredential;
+
+		assert.deepEqual(credential.env, { VENICE_API_KEY_2: "key-2", VENICE_API_KEY_3: "key-3" });
+	});
+
+	it("tells an environment-configured user which variable to export", async () => {
+		useAuthFile();
+		process.env.VENICE_API_KEY = "key-1";
+		const flow = interaction([]);
+
+		await assert.rejects(veniceApiKeyAuth().login!(flow), /export VENICE_API_KEY_2=<key>/);
+		assert.deepEqual(flow.prompts, []);
+	});
+});
+
+describe("nextFallbackIndex", () => {
+	afterEach(() => {
+		delete process.env.VENICE_API_KEY_2;
+		delete process.env.VENICE_API_KEY_4;
+	});
+
+	it("skips indices already present in either environment", () => {
+		process.env.VENICE_API_KEY_2 = "key-2";
+		assert.equal(nextFallbackIndex({ VENICE_API_KEY_4: "key-4" }), 3);
 	});
 });
