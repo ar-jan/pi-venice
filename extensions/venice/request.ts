@@ -5,6 +5,11 @@
  * thinking level's override, and the request's `samplingParams` that sets `venice_parameters`
  * replaces it whole. Merging `venice_parameters` here, key by key and after pi has assembled the
  * body, keeps the extension default and every user layer together.
+ *
+ * Thinking is turned off with `venice_parameters.disable_thinking` for the models whose entry
+ * offers "off" without a wire value (see DISABLE_THINKING_MODELS in index.ts). Models that list a
+ * `"none"` effort keep sending `reasoning_effort: "none"`, which Venice honors natively; on the
+ * rest the toggle only strips the reasoning text while still billing it, so they do not offer "off".
  */
 
 import type {
@@ -29,6 +34,8 @@ export interface VeniceRequestContext {
 	env?: ProviderEnv;
 	/** User `venice_parameters` values in pi's merge order: model, thinking level, request. */
 	veniceParameterLayers?: readonly unknown[];
+	/** The effective thinking level is off, so ask Venice to disable and strip reasoning. */
+	disableThinking?: boolean;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -51,9 +58,10 @@ function promptCacheKey(context: VeniceRequestContext): string | undefined {
 
 /**
  * Add Venice defaults to a chat completions body:
- * - `venice_parameters`: `include_venice_system_prompt: false`, then each user layer key by key,
- *   then the body's own value, so later layers win per key. A non-object value in the body is left
- *   for Venice to reject; non-object layers are skipped.
+ * - `venice_parameters`: `include_venice_system_prompt: false` and, at thinking level off,
+ *   `disable_thinking: true`, then each user layer key by key, then the body's own value, so later
+ *   layers win per key. A non-object value in the body is left for Venice to reject; non-object
+ *   layers are skipped.
  * - `prompt_cache_key` from the session ID, so Venice routes the session to servers holding its
  *   cached prefix. Skipped when the body already has one or prompt caching is off.
  */
@@ -64,6 +72,7 @@ export function applyVeniceDefaults(payload: unknown, context: VeniceRequestCont
 	const veniceParameters = body.venice_parameters;
 	if (veniceParameters === undefined || isPlainObject(veniceParameters)) {
 		const merged: Record<string, unknown> = { include_venice_system_prompt: false };
+		if (context.disableThinking) merged.disable_thinking = true;
 		for (const layer of [...(context.veniceParameterLayers ?? []), veniceParameters]) {
 			if (isPlainObject(layer)) Object.assign(merged, layer);
 		}
@@ -76,31 +85,45 @@ export function applyVeniceDefaults(payload: unknown, context: VeniceRequestCont
 	return body;
 }
 
-/** The `venice_parameters` of each layer pi merges, for the clamped thinking level. */
+/** The `venice_parameters` of each layer pi merges, for an already clamped thinking level. */
 function veniceParameterLayers(
 	model: Model<Api>,
 	level: ModelThinkingLevel,
 	requestParams: SamplingParams | undefined,
-	clamp: ClampThinkingLevel,
 ): unknown[] {
 	return [
 		model.samplingParams?.venice_parameters,
-		model.samplingParamsByThinkingLevel?.[clamp(model, level)]?.venice_parameters,
+		model.samplingParamsByThinkingLevel?.[level]?.venice_parameters,
 		requestParams?.venice_parameters,
 	];
 }
 
-function withDefaults<T extends StreamOptions>(options: T | undefined, layers: readonly unknown[]): T {
+function withDefaults<T extends StreamOptions>(
+	options: T | undefined,
+	layers: readonly unknown[],
+	disableThinking: boolean,
+): T {
 	const callerOnPayload = options?.onPayload;
 	return {
 		...options,
 		onPayload: async (payload, model) => {
-			const prepared = applyVeniceDefaults(payload, { ...options, veniceParameterLayers: layers });
+			const prepared = applyVeniceDefaults(payload, {
+				...options,
+				veniceParameterLayers: layers,
+				disableThinking,
+			});
 			// Extension `before_provider_request` hooks arrive here and see the prepared body.
 			const replaced = await callerOnPayload?.(prepared, model);
 			return replaced === undefined ? prepared : replaced;
 		},
 	} as T;
+}
+
+/** Whether this request asks Venice's own toggle to turn thinking off. */
+function thinkingOff(model: Model<Api>, level: ModelThinkingLevel): boolean {
+	// "off" maps to a string ("none") where Venice accepts that effort, and pi sends it itself.
+	// Only a level offered without a wire value needs the Venice parameter.
+	return model.reasoning === true && level === "off" && model.thinkingLevelMap?.off === undefined;
 }
 
 /** Wrap an API implementation so every request through it gets the Venice defaults. */
@@ -109,13 +132,15 @@ export function withVeniceRequestDefaults(api: ProviderStreams, clamp: ClampThin
 		...api,
 		stream: (model, context, options) => {
 			// The completions adapter reads `reasoningEffort`; pi uses "off" when it is unset.
-			const level = (options as { reasoningEffort?: ModelThinkingLevel } | undefined)?.reasoningEffort ?? "off";
-			const layers = veniceParameterLayers(model, level, options?.samplingParams, clamp);
-			return api.stream(model, context, withDefaults(options, layers));
+			const requested = (options as { reasoningEffort?: ModelThinkingLevel } | undefined)?.reasoningEffort ?? "off";
+			const level = clamp(model, requested);
+			const layers = veniceParameterLayers(model, level, options?.samplingParams);
+			return api.stream(model, context, withDefaults(options, layers, thinkingOff(model, level)));
 		},
 		streamSimple: (model, context, options) => {
-			const layers = veniceParameterLayers(model, options?.reasoning ?? "off", options?.samplingParams, clamp);
-			return api.streamSimple(model, context, withDefaults(options, layers));
+			const level = clamp(model, options?.reasoning ?? "off");
+			const layers = veniceParameterLayers(model, level, options?.samplingParams);
+			return api.streamSimple(model, context, withDefaults(options, layers, thinkingOff(model, level)));
 		},
 	};
 }

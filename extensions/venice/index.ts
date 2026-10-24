@@ -5,7 +5,8 @@
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
  *   support tool calling, and cached in models-store.json for offline use.
  * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier.
- * - Requests disable Venice's own system prompt and carry a per-session `prompt_cache_key`
+ * - Requests disable Venice's own system prompt, carry a per-session `prompt_cache_key`, and turn
+ *   thinking off with `venice_parameters.disable_thinking` on the models verified to honor it
  *   (see request.ts).
  */
 
@@ -77,6 +78,30 @@ interface VeniceModel {
 
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+// Models that list no "none" effort but were verified against the live API to actually stop
+// reasoning when Venice is asked to disable thinking: with `venice_parameters.disable_thinking`
+// their completion tokens drop to the answer alone (or Venice reports reasoning_tokens 0).
+// On every other such model Venice only strips the reasoning text while still generating and
+// billing it, so offering "off" there would promise something the request does not deliver.
+// Re-verify when Venice changes these models or moves them to another backend.
+const DISABLE_THINKING_MODELS = new Set([
+	"abliteration-abliterated-model-large-flash",
+	"claude-opus-4-6",
+	"claude-opus-4-7",
+	"gemini-3-5-flash-lite",
+	"grok-4-20",
+	"minimax-m3-preview",
+	"qwen-3-6-plus",
+	"qwen-3-7-max",
+	"qwen-3-7-plus",
+	"qwen-3-8-flash",
+	"qwen3-6-35b-a3b",
+	"qwen3-235b-a22b-thinking-2507",
+	"seed-2-1-turbo",
+	"zai-org-glm-4.6",
+	"zai-org-glm-4.7",
+]);
+
 function thinkingConfig(model: VeniceModel): Pick<Model<Api>, "reasoning" | "thinkingLevelMap"> & {
 	supportsReasoningEffort: boolean;
 } {
@@ -85,16 +110,20 @@ function thinkingConfig(model: VeniceModel): Pick<Model<Api>, "reasoning" | "thi
 		return { reasoning: false, supportsReasoningEffort: false };
 	}
 	const options = caps.supportsReasoningEffort ? (caps.reasoningEffortOptions ?? []) : [];
+	// "none" is an effort Venice accepts itself. Otherwise "off" is offered only for verified
+	// models, and without a map value: pi then sends no reasoning_effort, and the request layer adds
+	// venice_parameters.disable_thinking (see request.ts). null keeps it unsupported everywhere else.
+	const off = options.includes("none") ? "none" : DISABLE_THINKING_MODELS.has(model.id) ? undefined : null;
 	if (options.length === 0) {
-		// Reasons, but Venice does not accept reasoning_effort: expose one level meaning "model default".
+		// No effort control: "medium" stays unset, which pi reads as a single "model default" level.
 		return {
 			reasoning: true,
 			supportsReasoningEffort: false,
-			thinkingLevelMap: { off: null, minimal: null, low: null, high: null },
+			thinkingLevelMap: { off, minimal: null, low: null, high: null },
 		};
 	}
 	const map: ThinkingLevelMap = {
-		off: options.includes("none") ? "none" : null,
+		off,
 		minimal: options.includes("minimal") ? "minimal" : null,
 	};
 	for (const level of EFFORT_LEVELS) {

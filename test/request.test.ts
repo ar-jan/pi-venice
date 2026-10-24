@@ -68,6 +68,8 @@ describe("applyVeniceDefaults", () => {
 describe("withVeniceRequestDefaults", () => {
 	type Level = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	type FakeModel = {
+		reasoning?: boolean;
+		thinkingLevelMap?: { off?: string | null };
 		samplingParams?: Record<string, unknown>;
 		samplingParamsByThinkingLevel?: Partial<Record<Level, Record<string, unknown>>>;
 	};
@@ -172,5 +174,64 @@ describe("withVeniceRequestDefaults", () => {
 			enable_web_search: "on",
 			strip_thinking_response: true,
 		});
+	});
+
+	it("disables thinking at level off where off has no wire value", async () => {
+		const sent: unknown[] = [];
+		const model: FakeModel = { reasoning: true, thinkingLevelMap: { off: undefined } };
+		const api = withVeniceRequestDefaults(fakeApi(sent), identityClamp);
+
+		await api.streamSimple(model as never, {} as never, {});
+		await api.stream(model as never, {} as never, undefined);
+
+		assert.deepEqual(veniceParametersSent(sent), {
+			include_venice_system_prompt: false,
+			disable_thinking: true,
+		});
+	});
+
+	it("leaves thinking to reasoning_effort where off maps to none", async () => {
+		const sent: unknown[] = [];
+		const model: FakeModel = { reasoning: true, thinkingLevelMap: { off: "none" } };
+		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {});
+		assert.deepEqual(veniceParametersSent(sent), { include_venice_system_prompt: false });
+	});
+
+	it("leaves thinking alone above level off and on non-reasoning models", async () => {
+		const sent: unknown[] = [];
+		const api = withVeniceRequestDefaults(fakeApi(sent), identityClamp);
+
+		await api.streamSimple({ reasoning: true } as never, {} as never, { reasoning: "high" });
+		await api.streamSimple({ reasoning: false } as never, {} as never, {});
+
+		for (const body of sent) assert.equal("disable_thinking" in (veniceParametersSent([body]) as object), false);
+	});
+
+	it("lets a user layer turn disable_thinking back off", async () => {
+		const sent: unknown[] = [];
+		const model: FakeModel = {
+			reasoning: true,
+			samplingParamsByThinkingLevel: { off: { venice_parameters: { disable_thinking: false } } },
+		};
+		await withVeniceRequestDefaults(fakeApi(sent), identityClamp).streamSimple(model as never, {} as never, {});
+		assert.deepEqual(veniceParametersSent(sent), {
+			include_venice_system_prompt: false,
+			disable_thinking: false,
+		});
+	});
+
+	it("applies the off-level layer to a model whose off level is unset in its map", async () => {
+		// Off is selectable without a thinkingLevelMap entry; clamping must keep it so the
+		// user's off-level venice_parameters apply.
+		const sent: unknown[] = [];
+		const clamp = () => "off" as Level;
+		const model: FakeModel = {
+			reasoning: true,
+			samplingParamsByThinkingLevel: { off: { venice_parameters: { disable_thinking: false } } },
+		};
+		await withVeniceRequestDefaults(fakeApi(sent, clamp), clamp).stream(model as never, {} as never, {
+			reasoningEffort: "high",
+		} as StreamOptions);
+		assert.equal((veniceParametersSent(sent) as Record<string, unknown>).disable_thinking, false);
 	});
 });
