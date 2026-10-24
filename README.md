@@ -12,6 +12,40 @@ pi install git:github.com/ar-jan/pi-venice
 
 `/login venice` (stored in `auth.json`), or via the `VENICE_API_KEY` environment variable.
 
+## Key rotation
+
+A second (or third) key can take over when the current key runs out of credits. Put the extra keys
+in `VENICE_API_KEY_2`, comma- or whitespace-separated:
+
+```bash
+export VENICE_API_KEY=key-1
+export VENICE_API_KEY_2=key-2
+```
+
+The primary key is the `/login` credential or `VENICE_API_KEY`; fallbacks are appended in order and
+duplicates are dropped. Keys can also be stored in `auth.json` under the provider's `env` object
+(provider-scoped values take precedence over the process environment):
+
+```json
+{
+  "venice": {
+    "type": "api_key",
+    "key": "key-1",
+    "env": { "VENICE_API_KEY_2": "key-2" }
+  }
+}
+```
+
+Rotation is transparent and costs no extra requests in normal use: when Venice rejects a request
+with HTTP 402 (`INSUFFICIENT_BALANCE`, `API_KEY_USD_SPEND_LIMIT_EXCEEDED`, or
+`API_KEY_DIEM_SPEND_LIMIT_EXCEEDED`) before the response starts, the request is retried once on the
+next key. The switch is remembered for the process lifetime, so later requests go straight to the
+working key. When every key fails, the next request starts from the primary again.
+
+A 402 that arrives after content has streamed cannot be replayed; the error is passed through, but
+the next key is still remembered for later requests. Restart Pi to retry the primary key after
+topping it up.
+
 ## Update
 
 ```bash

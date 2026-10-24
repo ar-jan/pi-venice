@@ -25,6 +25,7 @@ import {
 // stable entry point for API implementations.
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { withKeyRotation } from "./keyring.ts";
 import { withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
@@ -260,7 +261,7 @@ export default function (pi: ExtensionAPI) {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
 				return fetchVeniceModels(key, context.signal);
 			},
-			api: withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel),
+			api: withKeyRotation(withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel)),
 		}),
 	);
 }
