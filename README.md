@@ -47,7 +47,15 @@ Rotation is transparent and costs no extra requests in normal use: when Venice r
 with HTTP 402 (`INSUFFICIENT_BALANCE`, `API_KEY_USD_SPEND_LIMIT_EXCEEDED`, or
 `API_KEY_DIEM_SPEND_LIMIT_EXCEEDED`) before the response starts, the request is retried once on the
 next key. The switch is remembered for the process lifetime, so later requests go straight to the
-working key. When every key fails, the next request starts from the primary again.
+working key. When every key fails, the next request returns to your selected key, or the primary
+when none is selected.
+
+**Choosing the active key.** Run `/venice-key` to pick which key a request starts with, or
+`/venice-key 2` to select by number. The selector lists each key's source (stored credential,
+`VENICE_API_KEY_2`, ...), shows only the last four characters, and marks the current key. The choice
+is persisted in `~/.pi/agent/venice-keys.json` as a SHA-256 fingerprint (not the key itself) and is
+restored on the next start. Automatic failover still advances to the next key; when all keys fail,
+the next request returns to your selected key. Run `/venice-key 1` to go back to the primary.
 
 A 402 that arrives after content has streamed cannot be replayed; the error is passed through, but
 the next key is still remembered for later requests. Restart Pi to retry the primary key after

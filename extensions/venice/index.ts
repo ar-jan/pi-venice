@@ -25,7 +25,16 @@ import {
 // stable entry point for API implementations.
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { withKeyRotation, veniceApiKeyAuth } from "./keyring.ts";
+import {
+	candidateKeys,
+	describeKeys,
+	Keyring,
+	keyFingerprint,
+	loadPreferredKeyHash,
+	savePreferredKeyHash,
+	veniceApiKeyAuth,
+	withKeyRotation,
+} from "./keyring.ts";
 import { withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
@@ -250,6 +259,7 @@ async function fetchVeniceModels(apiKey: string | undefined, signal: AbortSignal
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
+	const keyring = new Keyring(loadPreferredKeyHash());
 	pi.registerProvider(
 		createProvider({
 			id: PROVIDER_ID,
@@ -261,7 +271,50 @@ export default function (pi: ExtensionAPI) {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
 				return fetchVeniceModels(key, context.signal);
 			},
-			api: withKeyRotation(withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel)),
+			api: withKeyRotation(
+				withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel),
+				keyring,
+			),
 		}),
 	);
+
+	pi.registerCommand("venice-key", {
+		description: "Select the active Venice API key",
+		handler: async (args, ctx) => {
+			const auth = await ctx.modelRegistry.getProviderAuth(PROVIDER_ID).catch(() => undefined);
+			const keys = candidateKeys(auth?.auth.apiKey, auth?.env);
+			if (keys.length === 0) {
+				ctx.ui.notify("No Venice API keys configured. Run /login venice or set VENICE_API_KEY.", "warning");
+				return;
+			}
+			const current = keyring.select(keys);
+			const choices = describeKeys(keys, auth?.env, auth?.source, current);
+			const choose = (index: number) => {
+				const choice = choices[index]!;
+				keyring.choose(choice.key);
+				savePreferredKeyHash(keyFingerprint(choice.key));
+				ctx.ui.notify(`Active Venice API key: ${choice.label.replace(/^\S*\s*/, "")}`, "info");
+			};
+
+			const requested = args.trim();
+			if (requested) {
+				const index = Number(requested);
+				if (!Number.isInteger(index) || index < 1 || index > keys.length) {
+					ctx.ui.notify(`Choose a key number from 1 to ${keys.length}.`, "error");
+					return;
+				}
+				choose(index - 1);
+				return;
+			}
+
+			if (!ctx.hasUI) {
+				ctx.ui.notify(choices.map((choice) => choice.label).join("\n"), "info");
+				return;
+			}
+			const selected = await ctx.ui.select("Active Venice API key", choices.map((choice) => choice.label));
+			if (!selected) return;
+			const chosen = choices.findIndex((choice) => choice.label === selected);
+			if (chosen >= 0) choose(chosen);
+		},
+	});
 }

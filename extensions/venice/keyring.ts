@@ -9,13 +9,14 @@
  * forwarded unchanged; only a 402 before the response starts switches keys. The switched key is
  * remembered for the process lifetime, so later requests do not hit the exhausted key again.
  *
- * Fallback keys come from `VENICE_API_KEY_2` (comma- or whitespace-separated), either from the
- * process environment or from a provider-scoped `env` entry in auth.json. The primary key always
- * comes first, so key1 is used until Venice reports it exhausted.
+ * Fallback keys come from numbered variables `VENICE_API_KEY_2`, `VENICE_API_KEY_3`, ... in the
+ * process environment or a provider-scoped `env` entry in auth.json. By default the primary key is
+ * used first; `/venice-key` can start from any configured key and remembers that choice.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
 	ApiKeyAuth,
@@ -141,13 +142,25 @@ export function candidateKeys(primary: string | undefined, env: ProviderEnv | un
 
 /**
  * Which key to use next. State is process-wide because auth resolution returns the primary key for
- * every request; the wrapper has to remember that the primary ran dry.
+ * every request; the wrapper has to remember both the user's choice and any failover.
+ *
+ * `preferred` is the user's selection, persisted across runs. `active` is the key currently in use
+ * and may have moved on after a 402. An all-keys-failed request drops `active` back to `preferred`.
  */
 export class Keyring {
 	private active: string | undefined;
+	private preferredHash: string | undefined;
+
+	constructor(preferredHash?: string) {
+		this.preferredHash = preferredHash;
+	}
 
 	select(keys: readonly string[]): string | undefined {
 		if (this.active && keys.includes(this.active)) return this.active;
+		if (this.preferredHash) {
+			const preferred = keys.find((key) => keyFingerprint(key) === this.preferredHash);
+			if (preferred) return (this.active = preferred);
+		}
 		return (this.active = keys[0]);
 	}
 
@@ -158,9 +171,83 @@ export class Keyring {
 		return (this.active = keys[index + 1]);
 	}
 
-	/** Forget the switch, so the next request tries the primary key again. */
+	/** Make `key` the user's choice from now on, including after a restart. */
+	choose(key: string): void {
+		this.active = key;
+		this.preferredHash = keyFingerprint(key);
+	}
+
+	/** Forget the current failover, so the next request tries the user's preferred key again. */
 	reset(): void {
 		this.active = undefined;
+	}
+}
+
+export function keyFingerprint(key: string): string {
+	return createHash("sha256").update(key).digest("hex");
+}
+
+/** Short, non-reversible display form used by `/venice-key`. */
+export function maskedKey(key: string): string {
+	return key.length <= 4 ? "****" : `…${key.slice(-4)}`;
+}
+
+/** The env variable a fallback key came from, when it can be determined. */
+function keyVariable(key: string, env: ProviderEnv | undefined): string | undefined {
+	for (const source of [env, process.env]) {
+		for (const [name, value] of Object.entries(source ?? {})) {
+			if (fallbackIndex(name) === undefined || typeof value !== "string") continue;
+			const keys = value
+				.split(/[\s,]+/)
+				.map((candidate) => candidate.trim());
+			if (keys.includes(key)) return name;
+		}
+	}
+	return undefined;
+}
+
+export interface KeyChoice {
+	key: string;
+	label: string;
+}
+
+/** Labels for the selector: number, source variable, masked key, and the current marker. */
+export function describeKeys(
+	keys: readonly string[],
+	env: ProviderEnv | undefined,
+	source: string | undefined,
+	active: string | undefined,
+): KeyChoice[] {
+	return keys.map((key, index) => {
+		const from = index === 0 ? (source ?? "primary") : (keyVariable(key, env) ?? `fallback ${index + 1}`);
+		const marker = key === active ? "●" : " ";
+		return { key, label: `${marker} ${index + 1}. ${from} (${maskedKey(key)})` };
+	});
+}
+
+/** Stable, non-secret way to remember a key across runs. */
+const PREFERENCE_FILE = "venice-keys.json";
+
+function preferencePath(): string {
+	return join(getAgentDir(), PREFERENCE_FILE);
+}
+
+export function loadPreferredKeyHash(): string | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(preferencePath(), "utf8")) as { active?: unknown };
+		return typeof parsed.active === "string" ? parsed.active : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function savePreferredKeyHash(hash: string): void {
+	try {
+		const path = preferencePath();
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify({ active: hash }, null, 2)}\n`, "utf8");
+	} catch {
+		// Selection still applies for this process when the preference file is not writable.
 	}
 }
 
@@ -276,8 +363,7 @@ function rotatedAttempt(
 }
 
 /** Wrap a provider's streams so a balance failure on one key transparently retries the next key. */
-export function withKeyRotation(api: ProviderStreams): ProviderStreams {
-	const keyring = new Keyring();
+export function withKeyRotation(api: ProviderStreams, keyring: Keyring = new Keyring()): ProviderStreams {
 	return {
 		...api,
 		stream: (model, context, options) => {

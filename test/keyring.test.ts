@@ -14,7 +14,17 @@ import type {
 	SimpleStreamOptions,
 	StreamOptions,
 } from "@earendil-works/pi-ai";
-import { candidateKeys, nextFallbackIndex, veniceApiKeyAuth, withKeyRotation } from "../extensions/venice/keyring.ts";
+import {
+	candidateKeys,
+	describeKeys,
+	Keyring,
+	keyFingerprint,
+	loadPreferredKeyHash,
+	nextFallbackIndex,
+	savePreferredKeyHash,
+	veniceApiKeyAuth,
+	withKeyRotation,
+} from "../extensions/venice/keyring.ts";
 
 const zeroUsage = () => ({
 	input: 0,
@@ -214,6 +224,68 @@ describe("withKeyRotation", () => {
 
 		assert.deepEqual(api.calls, ["key-1", "key-2"]);
 		assert.equal(result.stopReason, "stop");
+	});
+});
+
+describe("Keyring", () => {
+	const keys = ["key-1", "key-2", "key-3"];
+
+	it("starts from the persisted selection", () => {
+		assert.equal(new Keyring(keyFingerprint("key-2")).select(keys), "key-2");
+	});
+
+	it("falls back to the primary when the persisted key is gone", () => {
+		assert.equal(new Keyring(keyFingerprint("removed")).select(keys), "key-1");
+	});
+
+	it("keeps a user choice across a reset", () => {
+		const keyring = new Keyring();
+		keyring.choose("key-3");
+		keyring.reset();
+		assert.equal(keyring.select(keys), "key-3");
+	});
+
+	it("still prefers the user choice after failover", () => {
+		const keyring = new Keyring();
+		keyring.choose("key-2");
+		assert.equal(keyring.select(keys), "key-2");
+		assert.equal(keyring.rotate(keys, "key-2"), "key-3");
+		assert.equal(keyring.select(keys), "key-3");
+		keyring.reset();
+		assert.equal(keyring.select(keys), "key-2");
+	});
+});
+
+describe("describeKeys", () => {
+	it("shows the source variable, a masked key, and the current marker", () => {
+		const choices = describeKeys(["key-1", "key-2"], { VENICE_API_KEY_2: "key-2" }, "stored credential", "key-2");
+
+		assert.deepEqual(
+			choices.map((choice) => choice.label),
+			["  1. stored credential (…ey-1)", "● 2. VENICE_API_KEY_2 (…ey-2)"],
+		);
+	});
+});
+
+describe("preferred key persistence", () => {
+	const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+	afterEach(() => {
+		if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+	});
+
+	it("round-trips the hash and ignores a missing file", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-venice-pref-"));
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			assert.equal(loadPreferredKeyHash(), undefined);
+			const hash = keyFingerprint("key-2");
+			savePreferredKeyHash(hash);
+			assert.equal(loadPreferredKeyHash(), hash);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
