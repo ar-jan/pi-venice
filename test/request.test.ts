@@ -103,9 +103,132 @@ describe("applyVeniceDefaults", () => {
 	});
 });
 
+describe("Claude cache breakpoints", () => {
+	const cache = { type: "ephemeral" };
+	const image = { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } };
+	const toolCall = (id: string) => ({
+		role: "assistant",
+		content: null,
+		tool_calls: [{ id, type: "function", function: { name: "read", arguments: "{}" } }],
+	});
+	const messagesOf = (payload: unknown) => (payload as { messages: Record<string, unknown>[] }).messages;
+	const withBreakpoints = (messages: unknown[], extra: Record<string, unknown> = {}) =>
+		messagesOf(applyVeniceDefaults(body({ messages }), { cacheBreakpoints: true, ...extra }));
+
+	it("marks the developer message on a text part and the last tool result on the message", () => {
+		const input = [
+			{ role: "developer", content: "You are pi." },
+			{ role: "user", content: "Read a file." },
+			toolCall("c1"),
+			{ role: "tool", tool_call_id: "c1", content: "first" },
+			toolCall("c2"),
+			{ role: "tool", tool_call_id: "c2", content: "second" },
+		];
+		const snapshot = structuredClone(input);
+		const messages = withBreakpoints(input);
+
+		assert.deepEqual(messages[0], {
+			role: "developer",
+			content: [{ type: "text", text: "You are pi.", cache_control: cache }],
+		});
+		assert.deepEqual(messages[5], { role: "tool", tool_call_id: "c2", content: "second", cache_control: cache });
+		// Only the last turn gets a breakpoint; Venice places its own on the turn before.
+		assert.deepEqual(messages.slice(1, 5), snapshot.slice(1, 5));
+		assert.deepEqual(input, snapshot);
+	});
+
+	it("marks the last user turn on its last text part, never on an image", () => {
+		const messages = withBreakpoints([
+			{ role: "system", content: [{ type: "text", text: "You are pi." }] },
+			{ role: "user", content: "Earlier turn." },
+			{ role: "assistant", content: "Done." },
+			{ role: "user", content: [{ type: "text", text: "Attached image(s) from tool result:" }, image] },
+		]);
+
+		assert.deepEqual(messages[0]?.content, [{ type: "text", text: "You are pi.", cache_control: cache }]);
+		assert.equal(messages[1]?.content, "Earlier turn.");
+		assert.deepEqual(messages[3], {
+			role: "user",
+			content: [{ type: "text", text: "Attached image(s) from tool result:", cache_control: cache }, image],
+		});
+	});
+
+	it("falls back to the latest turn that can carry a breakpoint", () => {
+		const messages = withBreakpoints([
+			{ role: "developer", content: "You are pi." },
+			{ role: "user", content: "Look at this." },
+			toolCall("c1"),
+			{ role: "tool", tool_call_id: "c1", content: "(see attached image)" },
+			{ role: "user", content: [image] },
+			{ role: "assistant", content: "Partial answer" },
+		]);
+
+		assert.deepEqual(messages[3]?.cache_control, cache);
+		assert.deepEqual(messages[4], { role: "user", content: [image] });
+		assert.equal(messages[5]?.content, "Partial answer");
+	});
+
+	it("keeps existing breakpoints", () => {
+		const longCache = { type: "ephemeral", ttl: "1h" };
+		const input = [
+			{ role: "developer", content: [{ type: "text", text: "You are pi.", cache_control: longCache }] },
+			{ role: "user", content: "Read a file." },
+			toolCall("c1"),
+			{ role: "tool", tool_call_id: "c1", content: "first", cache_control: longCache },
+		];
+		assert.deepEqual(withBreakpoints(input), input);
+	});
+
+	it("adds no breakpoints when prompt caching is off or the model does not need them", () => {
+		const input = [
+			{ role: "developer", content: "You are pi." },
+			{ role: "user", content: "Hello" },
+		];
+		assert.deepEqual(withBreakpoints(input, { cacheRetention: "none" }), input);
+		assert.deepEqual(messagesOf(applyVeniceDefaults(body({ messages: input }), {})), input);
+	});
+
+	it("is applied to Claude models only, before the caller's onPayload", async () => {
+		const prompt = [
+			{ role: "developer", content: "You are pi." },
+			{ role: "user", content: "Hello" },
+		];
+		const seen: unknown[] = [];
+		const api: ProviderStreams = {
+			stream: () => {
+				throw new Error("unused");
+			},
+			streamSimple: (model, _context, options) => {
+				const stream = createAssistantMessageEventStream();
+				void (async () => {
+					await options?.onPayload?.(body({ messages: prompt }), model);
+					stream.push({ type: "done", reason: "stop", message: assistant() });
+					stream.end();
+				})();
+				return stream;
+			},
+		};
+		const wrapped = withVeniceRequestDefaults(api, (_model, level) => level);
+		const onPayload = (payload: unknown) => {
+			seen.push(messagesOf(payload));
+			return undefined;
+		};
+
+		await drain(wrapped.streamSimple({ id: "claude-opus-5-5" } as never, {} as never, { onPayload }));
+		await drain(wrapped.streamSimple({ id: "kimi-k3" } as never, {} as never, { onPayload }));
+
+		assert.deepEqual(seen[0], [
+			{ role: "developer", content: [{ type: "text", text: "You are pi.", cache_control: cache }] },
+			{ role: "user", content: [{ type: "text", text: "Hello", cache_control: cache }] },
+		]);
+		assert.deepEqual(seen[1], prompt);
+	});
+});
+
 describe("withVeniceRequestDefaults", () => {
 	type Level = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	type FakeModel = {
+		id?: string;
 		reasoning?: boolean;
 		thinkingLevelMap?: { off?: string | null };
 		samplingParams?: Record<string, unknown>;
@@ -145,10 +268,11 @@ describe("withVeniceRequestDefaults", () => {
 		};
 	}
 
+	// Real models always carry an id; default to a model without explicit cache breakpoints.
 	const streamCall = (api: ProviderStreams, model: FakeModel, options?: StreamOptions) =>
-		drain(api.stream(model as never, {} as never, options));
+		drain(api.stream({ id: "kimi-k3", ...model } as never, {} as never, options));
 	const simpleCall = (api: ProviderStreams, model: FakeModel, options?: SimpleStreamOptions) =>
-		drain(api.streamSimple(model as never, {} as never, options));
+		drain(api.streamSimple({ id: "kimi-k3", ...model } as never, {} as never, options));
 
 	const veniceParametersSent = (sent: unknown[]) => (sent[0] as Record<string, unknown>).venice_parameters;
 

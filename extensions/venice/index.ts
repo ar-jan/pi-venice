@@ -6,9 +6,9 @@
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
  *   support tool calling, and cached in models-store.json for offline use.
  * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier.
- * - Requests disable Venice's own system prompt, carry a per-session `prompt_cache_key`, and turn
- *   thinking off with `venice_parameters.disable_thinking` on the models verified to honor it
- *   (see request.ts).
+ * - Requests disable Venice's own system prompt, carry a per-session `prompt_cache_key`, turn
+ *   thinking off with `venice_parameters.disable_thinking` on the models verified to honor it, and
+ *   place Claude cache breakpoints on the system prompt and the last turn (see request.ts).
  */
 
 import {

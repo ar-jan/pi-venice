@@ -15,6 +15,12 @@
  * OpenAI-completions adapter reads `prompt_tokens_details.cache_write_tokens`. The adapter therefore
  * counts written tokens as plain input and reports no cache-write cost. Wrapping the stream moves
  * them onto `cacheWrite` and recomputes the cost before pi sees each event.
+ *
+ * Claude needs explicit cache breakpoints. Venice adds its own on a `system` message and on the
+ * second-to-last user turn (tool results count as user turns), so the newest exchange is billed as
+ * uncached input and then written to the cache on the next request: every tool result is paid
+ * twice. Venice also adds no breakpoint for a `developer` message. Requests to Claude therefore get
+ * breakpoints of their own on the instruction message and the last turn (see withCacheBreakpoints).
  */
 
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -46,6 +52,8 @@ export interface VeniceRequestContext {
 	veniceParameterLayers?: readonly unknown[];
 	/** The effective thinking level is off, so ask Venice to disable and strip reasoning. */
 	disableThinking?: boolean;
+	/** The model needs explicit cache breakpoints (Claude); skipped when prompt caching is off. */
+	cacheBreakpoints?: boolean;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -175,6 +183,85 @@ function promptCacheKey(context: VeniceRequestContext): string | undefined {
 	return Array.from(context.sessionId).slice(0, PROMPT_CACHE_KEY_MAX_LENGTH).join("");
 }
 
+// =============================================================================
+// Claude cache breakpoints
+// =============================================================================
+
+/** A fresh object per breakpoint, so a later payload hook cannot change them all at once. */
+const ephemeralCache = () => ({ type: "ephemeral" });
+
+/** Claude caches only up to explicit breakpoints; every other Venice backend caches on its own. */
+function usesExplicitCacheBreakpoints(model: Model<Api>): boolean {
+	return model.id.startsWith("claude-");
+}
+
+/**
+ * A copy of `message` whose last text part carries a breakpoint, or `undefined` when it has no text
+ * to mark. A string content becomes a single text part. An existing `cache_control` is kept.
+ */
+function withTextBreakpoint(message: Record<string, unknown>): Record<string, unknown> | undefined {
+	const { content } = message;
+	if (typeof content === "string") {
+		return content.length > 0
+			? { ...message, content: [{ type: "text", text: content, cache_control: ephemeralCache() }] }
+			: undefined;
+	}
+	if (!Array.isArray(content)) return undefined;
+	for (let i = content.length - 1; i >= 0; i--) {
+		const part = content[i];
+		if (!isPlainObject(part) || part.type !== "text") continue;
+		if (part.cache_control !== undefined) return message;
+		const parts = [...content];
+		parts[i] = { ...part, cache_control: ephemeralCache() };
+		return { ...message, content: parts };
+	}
+	return undefined;
+}
+
+/**
+ * Place Claude cache breakpoints where Venice honors them (measured against the live API):
+ * - The first `system`/`developer` message, on its last text part. Venice adds no breakpoint of its
+ *   own for `developer`, so without this the first request of a session caches nothing.
+ * - The last turn, so the whole prompt is written now and read back by the next request instead of
+ *   being billed as uncached input first. Venice reads a breakpoint on a `tool` message only from the
+ *   message itself and on a `user` message only from a text part, so each role gets its own form.
+ *   Venice ignores breakpoints on images, so a turn ending in an image is cached up to its
+ *   last text part. Messages of other roles and user messages without text are skipped, so the
+ *   breakpoint lands on the latest turn that can carry one.
+ *
+ * Together with Venice's own breakpoint on the second-to-last user turn this stays within Claude's
+ * limit of four. Messages are copied on write; the input is not mutated.
+ */
+function withCacheBreakpoints(body: Record<string, unknown>): Record<string, unknown> {
+	if (!Array.isArray(body.messages)) return body;
+	const messages: unknown[] = [...body.messages];
+
+	const instruction = messages.findIndex(
+		(message) => isPlainObject(message) && (message.role === "system" || message.role === "developer"),
+	);
+	if (instruction >= 0) {
+		const marked = withTextBreakpoint(messages[instruction] as Record<string, unknown>);
+		if (marked) messages[instruction] = marked;
+	}
+
+	for (let i = messages.length - 1; i > instruction; i--) {
+		const message = messages[i];
+		if (!isPlainObject(message)) continue;
+		if (message.role === "tool") {
+			if (message.cache_control === undefined) messages[i] = { ...message, cache_control: ephemeralCache() };
+			break;
+		}
+		if (message.role === "user") {
+			const marked = withTextBreakpoint(message);
+			if (!marked) continue;
+			messages[i] = marked;
+			break;
+		}
+	}
+
+	return { ...body, messages };
+}
+
 /**
  * Add Venice defaults to a chat completions body:
  * - `venice_parameters`: `include_venice_system_prompt: false` and, at thinking level off,
@@ -183,6 +270,8 @@ function promptCacheKey(context: VeniceRequestContext): string | undefined {
  *   layers are skipped.
  * - `prompt_cache_key` from the session ID, so Venice routes the session to servers holding its
  *   cached prefix. Skipped when the body already has one or prompt caching is off.
+ * - Claude cache breakpoints when `cacheBreakpoints` is set (see withCacheBreakpoints), unless
+ *   prompt caching is off.
  */
 export function applyVeniceDefaults(payload: unknown, context: VeniceRequestContext): unknown {
 	if (!isPlainObject(payload)) return payload;
@@ -200,6 +289,10 @@ export function applyVeniceDefaults(payload: unknown, context: VeniceRequestCont
 
 	const cacheKey = body.prompt_cache_key === undefined ? promptCacheKey(context) : undefined;
 	if (cacheKey) body = { ...body, prompt_cache_key: cacheKey };
+
+	if (context.cacheBreakpoints && resolveCacheRetention(context) !== "none") {
+		body = withCacheBreakpoints(body);
+	}
 
 	return body;
 }
@@ -232,6 +325,7 @@ function withDefaults<T extends StreamOptions>(
 				...options,
 				veniceParameterLayers: layers,
 				disableThinking,
+				cacheBreakpoints: usesExplicitCacheBreakpoints(model),
 			});
 			// Extension `before_provider_request` hooks arrive here and see the prepared body.
 			const replaced = await callerOnPayload?.(prepared, model);
