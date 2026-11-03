@@ -18,8 +18,10 @@ A second (or third) key can take over when the current key runs out of credits.
 
 **Stored credential (recommended).** Run `/login venice` once to store the primary key. Running it
 again prompts for another key and stores it in `auth.json` under the credential's `env` as
-`VENICE_API_KEY_2`; further runs use `VENICE_API_KEY_3`, and so on. The stored primary stays first.
-To replace the primary key, run `/logout venice` and log in again.
+`VENICE_API_KEY_2`; further runs use `VENICE_API_KEY_3`, and so on. The stored primary stays first,
+and a primary stored as a `$VAR` or `!command` reference is kept as written. To replace the primary
+key, run `/logout venice` and log in again (this also removes the stored fallback keys). If
+`auth.json` holds a Venice key that cannot be read, login stops instead of replacing it.
 
 **Environment.** If the primary key comes from `VENICE_API_KEY`, `/login venice` explains which
 variable to export instead, because a stored key would override the environment. Add fallbacks with

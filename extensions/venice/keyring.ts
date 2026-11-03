@@ -23,10 +23,11 @@ import type {
 	ApiKeyCredential,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
+	AuthResult,
 	ProviderEnv,
 	ProviderStreams,
 } from "@earendil-works/pi-ai";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 
 export const FALLBACK_KEY_PREFIX = "VENICE_API_KEY_";
 const FALLBACK_KEY_RE = /^VENICE_API_KEY_(\d+)$/;
@@ -83,17 +84,32 @@ export function nextFallbackIndex(env: ProviderEnv | undefined): number {
 	return index;
 }
 
-/** Read the credential `/login venice` previously stored, if any. */
-function readStoredCredential(): ApiKeyCredential | undefined {
-	try {
-		const parsed = JSON.parse(readFileSync(join(getAgentDir(), "auth.json"), "utf8")) as { venice?: ApiKeyCredential };
-		const credential = parsed.venice;
-		if (credential?.type === "api_key" && credential.key) return credential;
-	} catch {
-		// No readable auth.json: first-time login, or a store this extension cannot inspect.
-	}
-	return undefined;
+/** The `source` that `envApiKeyAuth` reports when auth came from the stored credential. */
+const STORED_CREDENTIAL_SOURCE = "stored credential";
+
+/**
+ * Whether auth that pi resolved through its own credential store came from a stored key.
+ * `envApiKeyAuth` reports this source when, and only when, a stored credential has a key.
+ * Only a yes/no: the resolved key has `$VAR` and `!command` references expanded, so it must
+ * never be written back (see `readStoredVeniceCredential`).
+ */
+export function isStoredCredentialAuth(auth: AuthResult | undefined): boolean {
+	return auth?.source === STORED_CREDENTIAL_SOURCE && Boolean(auth.auth.apiKey);
 }
+
+/**
+ * The stored credential exactly as written, read with pi's own auth.json reader (same path, BOM
+ * tolerant). Raw on purpose: pi's credential store resolves `!command` and `$VAR` keys on read,
+ * and login writes back what it is given, so a resolved key would replace the reference with
+ * the plaintext secret.
+ */
+export function readStoredVeniceCredential(): ApiKeyCredential | undefined {
+	const credential = readStoredCredential("venice");
+	return credential?.type === "api_key" && credential.key ? credential : undefined;
+}
+
+/** Whether pi's credential store holds a Venice key, or undefined when that cannot be asked. */
+export type StoredCredentialCheck = () => Promise<boolean | undefined>;
 
 /**
  * Venice API-key auth whose login adds keys instead of replacing them.
@@ -103,12 +119,20 @@ function readStoredCredential(): ApiKeyCredential | undefined {
  * When the primary comes from `VENICE_API_KEY` instead, a stored key would silently override that
  * environment variable, so login explains the environment variable to set instead.
  */
-export function veniceApiKeyAuth(): ApiKeyAuth {
+export function veniceApiKeyAuth(hasStoredCredential: StoredCredentialCheck = async () => undefined): ApiKeyAuth {
 	const base = envApiKeyAuth("Venice API key", ["VENICE_API_KEY"]);
 	return {
 		...base,
 		login: async (interaction) => {
-			const stored = readStoredCredential();
+			const stored = readStoredVeniceCredential();
+			// "Nothing stored" returns a fresh credential, and pi's login replaces the stored one with
+			// it, dropping the primary and every fallback. Only take that path when pi agrees.
+			if (!stored && (await hasStoredCredential())) {
+				throw new Error(
+					"A Venice key is stored, but it could not be read from auth.json, so login will not replace it. Edit auth.json directly, or run /logout venice first.",
+				);
+			}
+			interaction.signal.throwIfAborted();
 			if (stored) {
 				const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(stored.env)}`;
 				const key = await interaction.prompt({

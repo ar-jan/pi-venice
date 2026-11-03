@@ -24,10 +24,11 @@ import {
 // resolved here and fail at load time. Keep the compat import until pi exposes a
 // stable entry point for API implementations.
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	candidateKeys,
 	describeKeys,
+	isStoredCredentialAuth,
 	Keyring,
 	keyFingerprint,
 	loadPreferredKeyHash,
@@ -260,12 +261,27 @@ async function fetchVeniceModels(apiKey: string | undefined, signal: AbortSignal
 
 export default function (pi: ExtensionAPI) {
 	const keyring = new Keyring(loadPreferredKeyHash());
+
+	// Login reads auth.json itself (pi's login API does not pass the stored credential) and asks
+	// pi's credential store, through the session's registry, whether a key is stored, so a failed
+	// read cannot replace the stored keys. Re-captured on every session start because a context
+	// goes stale after reload or session replacement.
+	let registry: ExtensionContext["modelRegistry"] | undefined;
+	pi.on("session_start", (_event, ctx) => {
+		registry = ctx.modelRegistry;
+	});
+	pi.on("session_shutdown", () => {
+		registry = undefined;
+	});
+	const hasStoredCredential = async () =>
+		registry ? isStoredCredentialAuth(await registry.getProviderAuth(PROVIDER_ID)) : undefined;
+
 	pi.registerProvider(
 		createProvider({
 			id: PROVIDER_ID,
 			name: "Venice AI",
 			baseUrl: BASE_URL,
-			auth: { apiKey: veniceApiKeyAuth() },
+			auth: { apiKey: veniceApiKeyAuth(hasStoredCredential) },
 			models: [],
 			fetchModels: (context) => {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;

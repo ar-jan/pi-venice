@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, createModels, createProvider } from "@earendil-works/pi-ai";
+// AuthStorage is not exported from the package root; the test uses the store pi itself runs on.
+import { AuthStorage } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js";
 import type {
 	ApiKeyCredential,
 	AssistantMessage,
@@ -17,6 +19,7 @@ import type {
 import {
 	candidateKeys,
 	describeKeys,
+	isStoredCredentialAuth,
 	Keyring,
 	keyFingerprint,
 	loadPreferredKeyHash,
@@ -294,11 +297,13 @@ describe("veniceApiKeyAuth login", () => {
 	const savedPrimary = process.env.VENICE_API_KEY;
 	const tempDirs: string[] = [];
 
-	function useAuthFile(credential?: unknown): void {
+	function useAuthFile(content?: unknown, raw = false): string {
 		const dir = mkdtempSync(join(tmpdir(), "pi-venice-auth-"));
 		tempDirs.push(dir);
 		process.env.PI_CODING_AGENT_DIR = dir;
-		if (credential !== undefined) writeFileSync(join(dir, "auth.json"), JSON.stringify(credential));
+		const path = join(dir, "auth.json");
+		if (content !== undefined) writeFileSync(path, raw ? String(content) : JSON.stringify(content));
+		return path;
 	}
 
 	function interaction(answers: string[]): ProviderAuthInteraction & { prompts: string[]; notices: string[] } {
@@ -332,7 +337,7 @@ describe("veniceApiKeyAuth login", () => {
 		useAuthFile();
 		delete process.env.VENICE_API_KEY;
 		const flow = interaction(["key-1"]);
-		const credential = await veniceApiKeyAuth().login!(flow);
+		const credential = await veniceApiKeyAuth(async () => false).login!(flow);
 
 		assert.deepEqual(credential, { type: "api_key", key: "key-1" });
 		assert.deepEqual(flow.prompts, ["Enter Venice API key"]);
@@ -368,6 +373,65 @@ describe("veniceApiKeyAuth login", () => {
 
 		await assert.rejects(veniceApiKeyAuth().login!(flow), /export VENICE_API_KEY_2=<key>/);
 		assert.deepEqual(flow.prompts, []);
+	});
+
+	it("keeps a $VAR or !command primary key as written", async () => {
+		useAuthFile({ venice: { type: "api_key", key: "!pass show venice" } });
+		delete process.env.VENICE_API_KEY;
+		const credential = (await veniceApiKeyAuth(async () => true).login!(interaction(["key-2"]))) as ApiKeyCredential;
+
+		assert.equal(credential.key, "!pass show venice");
+	});
+
+	it("reads an auth.json saved with a byte order mark", async () => {
+		useAuthFile(`\uFEFF${JSON.stringify({ venice: { type: "api_key", key: "key-1" } })}`, true);
+		delete process.env.VENICE_API_KEY;
+		const credential = (await veniceApiKeyAuth(async () => true).login!(interaction(["key-2"]))) as ApiKeyCredential;
+
+		assert.deepEqual(credential, { type: "api_key", key: "key-1", env: { VENICE_API_KEY_2: "key-2" } });
+	});
+
+	it("refuses to replace stored keys it cannot read", async () => {
+		useAuthFile("{ not json", true);
+		delete process.env.VENICE_API_KEY;
+		const flow = interaction(["key-9"]);
+
+		await assert.rejects(veniceApiKeyAuth(async () => true).login!(flow), /will not replace it/);
+		assert.deepEqual(flow.prompts, []);
+	});
+
+	it("keeps every key through pi's own login and auth.json store", async () => {
+		const path = useAuthFile({ venice: { type: "api_key", key: "$PV_TEST_PRIMARY" } });
+		delete process.env.VENICE_API_KEY;
+		process.env.PV_TEST_PRIMARY = "sk-resolved";
+		try {
+			const credentials = AuthStorage.create(path);
+			const models = createModels({ credentials });
+			const hasStored = async () => isStoredCredentialAuth(await models.getAuth("venice"));
+			models.setProvider(
+				createProvider({ id: "venice", auth: { apiKey: veniceApiKeyAuth(hasStored) }, models: [], api: fakeApi(() => outcome("done", "ok")) }),
+			);
+
+			await models.login("venice", "api_key", interaction(["key-2"]));
+			await models.login("venice", "api_key", interaction(["key-3"]));
+
+			assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).venice, {
+				type: "api_key",
+				key: "$PV_TEST_PRIMARY",
+				env: { VENICE_API_KEY_2: "key-2", VENICE_API_KEY_3: "key-3" },
+			});
+		} finally {
+			delete process.env.PV_TEST_PRIMARY;
+		}
+	});
+});
+
+describe("isStoredCredentialAuth", () => {
+	it("recognizes auth from a stored key and ignores environment-sourced auth", () => {
+		assert.equal(isStoredCredentialAuth({ auth: { apiKey: "key-1" }, source: "stored credential" }), true);
+		assert.equal(isStoredCredentialAuth({ auth: { apiKey: "key-1" }, source: "VENICE_API_KEY" }), false);
+		assert.equal(isStoredCredentialAuth({ auth: {}, source: "stored credential" }), false);
+		assert.equal(isStoredCredentialAuth(undefined), false);
 	});
 });
 
