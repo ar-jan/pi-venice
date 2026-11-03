@@ -89,6 +89,10 @@ support tool calling and do not require end-to-end encryption (E2EE), and cached
   to `cacheWrite` and the cost is recomputed, so cache reads and Claude's cache-write premium are
   reported accurately.
 - Venice's own system prompt is disabled (`venice_parameters.include_venice_system_prompt: false`).
+- NUL bytes are stripped from outgoing messages. Venice rejects any message containing U+0000 with
+  HTTP 400, so a tool result carrying binary bytes would otherwise break the session from then on:
+  both reading a binary file and a program printing decoded bytes end up in the transcript that Pi
+  replays with every request.
 - Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on a
   short list of models verified to honor `venice_parameters.disable_thinking` (see [Thinking](#thinking)).
 

@@ -103,6 +103,40 @@ describe("applyVeniceDefaults", () => {
 	});
 });
 
+describe("NUL bytes in messages", () => {
+	it("drops NUL bytes from message text, content parts and tool arguments", () => {
+		const input = body({
+			messages: [
+				{ role: "tool", tool_call_id: "c1", content: "\u007fELF\u0002\u0001\u0001\u0000\u0000" },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "a\u0000b" }],
+					tool_calls: [{ id: "c2", type: "function", function: { name: "read", arguments: '{"p":"x\u0000y"}' } }],
+				},
+			],
+		});
+		const snapshot = structuredClone(input);
+
+		const clean = applyVeniceDefaults(input, {}) as { messages: unknown };
+		assert.deepEqual(clean.messages, [
+			{ role: "tool", tool_call_id: "c1", content: "\u007fELF\u0002\u0001\u0001" },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "ab" }],
+				tool_calls: [{ id: "c2", type: "function", function: { name: "read", arguments: '{"p":"xy"}' } }],
+			},
+		]);
+		assert.ok(!JSON.stringify(clean).includes("\\u0000"));
+		assert.deepEqual(input, snapshot);
+	});
+
+	it("keeps other control characters and leaves clean messages by reference", () => {
+		const messages = [{ role: "user", content: "a\u0001b\u001bc\ufffdd" }];
+		const result = applyVeniceDefaults(body({ messages }), {}) as { messages: unknown };
+		assert.equal(result.messages, messages);
+	});
+});
+
 describe("Claude cache breakpoints", () => {
 	const cache = { type: "ephemeral" };
 	const image = { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } };

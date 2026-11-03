@@ -21,6 +21,13 @@
  * uncached input and then written to the cache on the next request: every tool result is paid
  * twice. Venice also adds no breakpoint for a `developer` message. Requests to Claude therefore get
  * breakpoints of their own on the instruction message and the last turn (see withCacheBreakpoints).
+ *
+ * Venice rejects a message string that contains a NUL byte (U+0000) with HTTP 400, "String must
+ * not contain null bytes"; every other control character is accepted. A NUL in one message therefore
+ * fails not only that turn but every later request in the session, because pi replays the whole
+ * transcript each time. Tool results are the usual source, in either of two ways: a command that
+ * reads a binary file (`cat` of an executable), or a program whose stdout carries raw bytes (e.g.
+ * printing a decoded blob). Such bytes are dropped from `messages` before sending.
  */
 
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -40,6 +47,8 @@ import type {
 
 /** Venice keeps the first 64 characters, like OpenAI. */
 const PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+
+const NUL = "\u0000";
 
 /** pi-ai's `clampThinkingLevel`, passed in so this module does not import the model catalog. */
 export type ClampThinkingLevel = (model: Model<Api>, level: ModelThinkingLevel) => ModelThinkingLevel;
@@ -263,7 +272,38 @@ function withCacheBreakpoints(body: Record<string, unknown>): Record<string, unk
 }
 
 /**
+ * Replace every string in `value` that holds a NUL byte, keeping untouched values by reference.
+ * Only the array and plain-object shapes a chat body uses are walked; anything else passes through.
+ */
+function withoutNullBytes(value: unknown): unknown {
+	if (typeof value === "string") return value.includes(NUL) ? value.replaceAll(NUL, "") : value;
+	if (Array.isArray(value)) {
+		let changed = false;
+		const next = value.map((item) => {
+			const clean = withoutNullBytes(item);
+			changed ||= clean !== item;
+			return clean;
+		});
+		return changed ? next : value;
+	}
+	if (isPlainObject(value)) {
+		let changed = false;
+		const next: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value)) {
+			const clean = withoutNullBytes(item);
+			changed ||= clean !== item;
+			next[key] = clean;
+		}
+		return changed ? next : value;
+	}
+	return value;
+}
+
+/**
  * Add Venice defaults to a chat completions body:
+ * - `messages`: NUL bytes dropped (see withoutNullBytes), so a tool result carrying binary bytes —
+ *   read from a file or printed by a program — cannot make Venice reject the session's every later
+ *   request.
  * - `venice_parameters`: `include_venice_system_prompt: false` and, at thinking level off,
  *   `disable_thinking: true`, then each user layer key by key, then the body's own value, so later
  *   layers win per key. A non-object value in the body is left for Venice to reject; non-object
@@ -276,6 +316,12 @@ function withCacheBreakpoints(body: Record<string, unknown>): Record<string, unk
 export function applyVeniceDefaults(payload: unknown, context: VeniceRequestContext): unknown {
 	if (!isPlainObject(payload)) return payload;
 	let body = payload;
+
+	const messages = body.messages;
+	if (Array.isArray(messages)) {
+		const clean = withoutNullBytes(messages);
+		if (clean !== messages) body = { ...body, messages: clean };
+	}
 
 	const veniceParameters = body.venice_parameters;
 	if (veniceParameters === undefined || isPlainObject(veniceParameters)) {
