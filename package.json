@@ -7,7 +7,9 @@
     "pi-package"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "check": "npm run typecheck && npm test"
   },
   "pi": {
     "extensions": [
@@ -19,6 +21,9 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5"
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

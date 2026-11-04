@@ -181,5 +181,12 @@ remove it, so set an explicit value such as `"off"`:
 ```bash
 pi -ne -e .           # one run with only this checkout loaded
 pi install .          # or install the working copy in place
-npm test              # unit tests (Node 22.6+)
+npm test              # unit and integration tests (Node 22.6+)
+npm run typecheck     # tsc --noEmit
+npm run check         # both
 ```
+
+The integration tests (`test/integration.test.ts`) run the provider's request pipeline through pi's
+real OpenAI-completions adapter against a local mock of Venice's chat endpoint; they make no network
+requests. The dev dependencies pin the pi packages the tests and typecheck run against; keep them at
+the pi release you target (`npm install -D @earendil-works/pi-ai@latest @earendil-works/pi-coding-agent@latest`).

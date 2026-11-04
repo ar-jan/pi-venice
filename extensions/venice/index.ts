@@ -16,6 +16,7 @@ import {
 	clampThinkingLevel,
 	createProvider,
 	type Model,
+	type ProviderStreams,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 // Pi's extension loader maps only a fixed set of pi-ai specifiers onto the host
@@ -259,6 +260,14 @@ async function fetchVeniceModels(apiKey: string | undefined, signal: AbortSignal
 // Extension
 // =============================================================================
 
+/**
+ * The request pipeline the provider registers: pi's OpenAI-completions adapter with the Venice
+ * request defaults inside, and key rotation outside so every retried key gets the same defaults.
+ */
+export function veniceApi(keyring: Keyring): ProviderStreams {
+	return withKeyRotation(withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel), keyring);
+}
+
 export default function (pi: ExtensionAPI) {
 	const keyring = new Keyring(loadPreferredKeyHash());
 
@@ -287,10 +296,7 @@ export default function (pi: ExtensionAPI) {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
 				return fetchVeniceModels(key, context.signal);
 			},
-			api: withKeyRotation(
-				withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel),
-				keyring,
-			),
+			api: veniceApi(keyring),
 		}),
 	);
 
