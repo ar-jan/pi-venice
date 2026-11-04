@@ -16,6 +16,11 @@
  * counts written tokens as plain input and reports no cache-write cost. Wrapping the stream moves
  * them onto `cacheWrite` and recomputes the cost before pi sees each event.
  *
+ * Venice also reports what it billed, as a top-level `cost` on the final usage chunk. That total is
+ * what pi shows, because a catalog estimate from token counts misses charges outside the token
+ * prices: web search adds about $0.01 a request, so a search turn can cost 20 times its tokens. The
+ * per-category amounts stay catalog estimates (see applyVeniceReportedCost).
+ *
  * Claude needs explicit cache breakpoints. Venice adds its own on a `system` message and on the
  * second-to-last user turn (tool results count as user turns), so the newest exchange is billed as
  * uncached input and then written to the cache on the next request: every tool result is paid
@@ -72,12 +77,15 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 // =============================================================================
-// Cache-write usage
+// Usage and billed cost
 // =============================================================================
 
-/** Raw cache-write count seen on the provider's chunks for the current request. */
-interface CacheWriteObservation {
+/** What the provider's raw chunks reported for the current request beyond what the adapter parses. */
+interface UsageObservation {
+	/** Cache-write tokens (Venice's `cache_creation_input_tokens`). */
 	writes: number;
+	/** Billed cost in dollars, once the final usage chunk has arrived. */
+	billed?: number;
 }
 
 function emptyUsage(): Usage {
@@ -105,9 +113,29 @@ function rawCacheWrites(chunk: unknown): number | undefined {
 	return typeof writes === "number" && writes > 0 ? writes : undefined;
 }
 
-function observeCacheWrites(chunk: unknown, observation: CacheWriteObservation): void {
+/**
+ * The billed cost on a raw chunk, from Venice's top-level `cost`: a USD part (bundled credits
+ * included as USD) and a DIEM part. Venice prices DIEM one to one with USD (every catalog price lists
+ * the same `usd` and `diem` amount), so their sum is the request's cost in the dollars pi shows.
+ * `undefined` when the chunk has no cost or any part is not a finite, non-negative number.
+ */
+function rawBilledCost(chunk: unknown): number | undefined {
+	if (!isPlainObject(chunk) || !isPlainObject(chunk.cost)) return undefined;
+	const parts = [chunk.cost.usd, chunk.cost.diem].filter((part) => part !== undefined);
+	if (parts.length === 0) return undefined;
+	let total = 0;
+	for (const part of parts) {
+		if (typeof part !== "number" || !Number.isFinite(part) || part < 0) return undefined;
+		total += part;
+	}
+	return total;
+}
+
+function observeUsage(chunk: unknown, observation: UsageObservation): void {
 	const writes = rawCacheWrites(chunk);
 	if (writes !== undefined && writes > observation.writes) observation.writes = writes;
+	const billed = rawBilledCost(chunk);
+	if (billed !== undefined) observation.billed = billed;
 }
 
 /**
@@ -125,6 +153,18 @@ export function applyVeniceCacheWriteUsage(usage: Usage, model: Model<Api>, writ
 	calculateCost(model, usage);
 }
 
+/**
+ * Make Venice's billed cost the usage total, as pi's types define it ("provider-reported billed cost
+ * when supported, otherwise the catalog estimate") and as pi's adapter does for OpenRouter. The
+ * per-category amounts keep their catalog estimates, so they can sum to less than the total when
+ * Venice bills extras such as web search. Idempotent; without a reported cost the estimate stays.
+ */
+export function applyVeniceReportedCost(usage: Usage, billed: number | undefined): void {
+	if (billed === undefined) return;
+	usage.cost.total = billed;
+	usage.cost.totalFromProvider = true;
+}
+
 function eventUsage(event: AssistantMessageEvent): Usage {
 	if (event.type === "done") return event.message.usage;
 	if (event.type === "error") return event.error.usage;
@@ -138,14 +178,15 @@ function eventMessage(event: AssistantMessageEvent): AssistantMessage {
 }
 
 /**
- * Forward a provider stream, correcting cache-write usage just before each event reaches pi. The
- * events carry the adapter's own message objects, so the same correction also reaches the final
- * `done`/`error` message and pi's cost accounting.
+ * Forward a provider stream, correcting usage just before each event reaches pi: cache-write tokens
+ * first (which recomputes the estimate), then the billed total. The events carry the adapter's own
+ * message objects, so the same correction also reaches the final `done`/`error` message and pi's
+ * cost accounting.
  */
-export function withVeniceCacheWriteUsage(
+export function withVeniceUsage(
 	stream: AssistantMessageEventStream,
 	model: Model<Api>,
-	observation: CacheWriteObservation,
+	observation: UsageObservation,
 ): AssistantMessageEventStream {
 	const forwarded = createAssistantMessageEventStream();
 	let last: AssistantMessage | undefined;
@@ -153,7 +194,9 @@ export function withVeniceCacheWriteUsage(
 		try {
 			for await (const event of stream) {
 				last = eventMessage(event);
-				applyVeniceCacheWriteUsage(eventUsage(event), model, observation.writes);
+				const usage = eventUsage(event);
+				applyVeniceCacheWriteUsage(usage, model, observation.writes);
+				applyVeniceReportedCost(usage, observation.billed);
 				forwarded.push(event);
 			}
 		} catch (error) {
@@ -360,7 +403,7 @@ function withDefaults<T extends StreamOptions>(
 	options: T | undefined,
 	layers: readonly unknown[],
 	disableThinking: boolean,
-	observation: CacheWriteObservation,
+	observation: UsageObservation,
 ): T {
 	const callerOnPayload = options?.onPayload;
 	const callerOnStreamEvent = options?.onProviderStreamEvent;
@@ -379,7 +422,7 @@ function withDefaults<T extends StreamOptions>(
 		},
 		onProviderStreamEvent: async (event, model) => {
 			// Observation only: pi documents this hook's payload as read-only.
-			observeCacheWrites(event, observation);
+			observeUsage(event, observation);
 			await callerOnStreamEvent?.(event, model);
 		},
 	} as T;
@@ -401,8 +444,8 @@ export function withVeniceRequestDefaults(api: ProviderStreams, clamp: ClampThin
 			const requested = (options as { reasoningEffort?: ModelThinkingLevel } | undefined)?.reasoningEffort ?? "off";
 			const level = clamp(model, requested);
 			const layers = veniceParameterLayers(model, level, options?.samplingParams);
-			const observation: CacheWriteObservation = { writes: 0 };
-			return withVeniceCacheWriteUsage(
+			const observation: UsageObservation = { writes: 0 };
+			return withVeniceUsage(
 				api.stream(model, context, withDefaults(options, layers, thinkingOff(model, level), observation)),
 				model,
 				observation,
@@ -411,8 +454,8 @@ export function withVeniceRequestDefaults(api: ProviderStreams, clamp: ClampThin
 		streamSimple: (model, context, options) => {
 			const level = clamp(model, options?.reasoning ?? "off");
 			const layers = veniceParameterLayers(model, level, options?.samplingParams);
-			const observation: CacheWriteObservation = { writes: 0 };
-			return withVeniceCacheWriteUsage(
+			const observation: UsageObservation = { writes: 0 };
+			return withVeniceUsage(
 				api.streamSimple(model, context, withDefaults(options, layers, thinkingOff(model, level), observation)),
 				model,
 				observation,

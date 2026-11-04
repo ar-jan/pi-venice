@@ -88,6 +88,8 @@ support tool calling and do not require end-to-end encryption (E2EE), and cached
   does not read. The streamed usage is corrected before Pi sees it: written tokens move from `input`
   to `cacheWrite` and the cost is recomputed, so cache reads and Claude's cache-write premium are
   reported accurately.
+- The cost Pi shows is what Venice billed, including charges outside the token prices such as web
+  search (see [Cost](#cost)).
 - Venice's own system prompt is disabled (`venice_parameters.include_venice_system_prompt: false`).
 - NUL bytes are stripped from outgoing messages. Venice rejects any message containing U+0000 with
   HTTP 400, so a tool result carrying binary bytes would otherwise break the session from then on:
@@ -95,6 +97,19 @@ support tool calling and do not require end-to-end encryption (E2EE), and cached
   replays with every request.
 - Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on a
   short list of models verified to honor `venice_parameters.disable_thinking` (see [Thinking](#thinking)).
+
+## Cost
+
+Venice reports the billed cost of every request at the end of the response stream, split into a USD
+and a DIEM part. Pi shows their sum as the request's cost (`usage.cost.total`, marked
+`totalFromProvider`), the same way it reports OpenRouter's billed cost. Venice prices DIEM one to one
+with USD, so the sum is in the same dollars as the catalog prices.
+
+A token-based estimate misses Venice's other charges. With `enable_web_search` on, Venice bills about
+$0.01 per search: a measured search turn cost $0.0105, where its tokens came to $0.0005. The
+per-category amounts (input, output, cache read, cache write) remain catalog estimates, so with such
+charges they add up to less than the total. A request that ends without Venice's report, for example
+when it is aborted, keeps the catalog estimate.
 
 ## Claude prompt caching
 

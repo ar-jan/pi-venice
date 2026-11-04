@@ -9,6 +9,8 @@
  * - Requests disable Venice's own system prompt, carry a per-session `prompt_cache_key`, turn
  *   thinking off with `venice_parameters.disable_thinking` on the models verified to honor it, and
  *   place Claude cache breakpoints on the system prompt and the last turn (see request.ts).
+ * - Usage: cache writes are moved onto `cacheWrite`, and the total cost is what Venice billed
+ *   (see request.ts).
  */
 
 import {

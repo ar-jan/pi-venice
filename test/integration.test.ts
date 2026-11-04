@@ -67,17 +67,24 @@ const chunk = (delta: Record<string, unknown>, finishReason: string | null = nul
 	choices: [{ index: 0, delta, finish_reason: finishReason }],
 });
 
-const usageChunk = (usage: Record<string, unknown>) => ({
+/** The final chunk: no choices, the usage, and (as Venice sends it) the billed cost at the top level. */
+const usageChunk = (usage: Record<string, unknown>, cost?: { usd: number; diem: number }) => ({
 	id: "chatcmpl-test",
 	object: "chat.completion.chunk",
 	created: 0,
 	model: "test",
 	choices: [],
 	usage,
+	...(cost ? { cost } : {}),
 });
 
-function streamText(res: ServerResponse, text: string, usage: Record<string, unknown> = { prompt_tokens: 10, completion_tokens: 2 }) {
-	sse(res, [chunk({ role: "assistant", content: text }), chunk({}, "stop"), usageChunk(usage)]);
+function streamText(
+	res: ServerResponse,
+	text: string,
+	usage: Record<string, unknown> = { prompt_tokens: 10, completion_tokens: 2 },
+	cost?: { usd: number; diem: number },
+) {
+	sse(res, [chunk({ role: "assistant", content: text }), chunk({}, "stop"), usageChunk(usage, cost)]);
 }
 
 /** Venice's documented body for a key without USD/DIEM balance. */
@@ -359,6 +366,41 @@ describe("usage and cost through the real adapter", () => {
 		assert.equal(message.usage.totalTokens, 15641);
 		near(message.usage.cost.cacheWrite, (15621 * 5) / 1e6);
 		near(message.usage.cost.total, (16 * 4 + 4 * 20 + 15621 * 5) / 1e6);
+		// No `cost` in the chunk: the total is the catalog estimate.
+		assert.notEqual(message.usage.cost.totalFromProvider, true);
+	});
+
+	it("shows the cost Venice billed, including charges outside the token prices", async () => {
+		// Shaped after a live web search turn: Venice billed the tokens plus about $0.01 for the search.
+		const tokens = (3369 * 4 + 48 * 20) / 1e6;
+		respond = (_request, res) =>
+			streamText(res, "ok", { prompt_tokens: 3369, completion_tokens: 48, prompt_tokens_details: { cached_tokens: 0 } }, {
+				usd: 0,
+				diem: tokens + 0.01,
+			});
+		const { message } = await run(veniceApi(new Keyring()), claude(), userContext(), { apiKey: "key-1" });
+
+		near(message.usage.cost.total, tokens + 0.01);
+		assert.equal(message.usage.cost.totalFromProvider, true);
+		// The per-category amounts stay catalog estimates.
+		near(message.usage.cost.input + message.usage.cost.output, tokens);
+	});
+
+	it("combines the cache-write correction with the billed total", async () => {
+		const billed = (16 * 4 + 4 * 20 + 15621 * 5) / 1e6;
+		respond = (_request, res) =>
+			streamText(
+				res,
+				"ok",
+				{ prompt_tokens: 15637, completion_tokens: 4, prompt_tokens_details: { cached_tokens: 0, cache_creation_input_tokens: 15621 } },
+				{ usd: 0.00005, diem: billed - 0.00005 },
+			);
+		const { message } = await run(veniceApi(new Keyring()), claude(), userContext(), { apiKey: "key-1" });
+
+		assert.equal(message.usage.input, 16);
+		assert.equal(message.usage.cacheWrite, 15621);
+		near(message.usage.cost.total, billed);
+		assert.equal(message.usage.cost.totalFromProvider, true);
 	});
 
 	it("leaves cache reads to the adapter", async () => {

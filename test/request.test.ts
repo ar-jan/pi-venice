@@ -446,7 +446,7 @@ describe("withVeniceRequestDefaults", () => {
 	});
 });
 
-describe("cache write usage", () => {
+describe("usage and billed cost", () => {
 	const model = {
 		id: "claude-opus-5-5",
 		api: "openai-completions",
@@ -522,6 +522,67 @@ describe("cache write usage", () => {
 		const message = await drain(withVeniceRequestDefaults(usageApi(raw, parsed), clamp).stream(model as never, {} as never));
 		assert.equal(message?.usage.input, 9900);
 		assert.equal(message?.usage.cacheWrite, 100);
+	});
+
+	const run = (raw: unknown, parsed: Usage) =>
+		drain(withVeniceRequestDefaults(usageApi(raw, parsed), clamp).stream(model as never, {} as never));
+
+	it("reports Venice's billed cost as the total and keeps the per-category estimates", async () => {
+		// A web search turn: Venice bills about $0.01 for the search on top of the tokens.
+		const parsed = parsedUsage({ input: 3369, output: 48, totalTokens: 3417 });
+		const tokens = (3369 * 4 + 48 * 20) / 1e6;
+		const raw = { usage: { prompt_tokens: 3369, completion_tokens: 48 }, cost: { usd: 0, diem: tokens + 0.01 } };
+		const message = await run(raw, parsed);
+
+		near(message!.usage.cost.total, tokens + 0.01);
+		assert.equal(message!.usage.cost.totalFromProvider, true);
+		near(message!.usage.cost.input, (3369 * 4) / 1e6);
+		near(message!.usage.cost.output, (48 * 20) / 1e6);
+	});
+
+	it("applies the billed total after moving cache writes", async () => {
+		const parsed = parsedUsage({ input: 15637, output: 4, totalTokens: 15641 });
+		const billed = (16 * 4 + 4 * 20 + 15621 * 5) / 1e6;
+		const raw = {
+			usage: {
+				prompt_tokens: 15637,
+				completion_tokens: 4,
+				prompt_tokens_details: { cached_tokens: 0, cache_creation_input_tokens: 15621 },
+			},
+			cost: { usd: 0, diem: billed },
+		};
+		const message = await run(raw, parsed);
+
+		assert.equal(message!.usage.input, 16);
+		assert.equal(message!.usage.cacheWrite, 15621);
+		near(message!.usage.cost.cacheWrite, (15621 * 5) / 1e6);
+		near(message!.usage.cost.total, billed);
+		assert.equal(message!.usage.cost.totalFromProvider, true);
+	});
+
+	it("adds the USD and DIEM parts of a split payment", async () => {
+		const parsed = parsedUsage({ input: 100, output: 10, totalTokens: 110 });
+		const message = await run({ usage: { prompt_tokens: 100 }, cost: { usd: 0.002, diem: 0.0005 } }, parsed);
+		near(message!.usage.cost.total, 0.0025);
+		assert.equal(message!.usage.cost.totalFromProvider, true);
+	});
+
+	it("trusts a billed cost of zero", async () => {
+		const parsed = parsedUsage({ input: 100, output: 10, totalTokens: 110 });
+		const message = await run({ usage: { prompt_tokens: 100 }, cost: { usd: 0, diem: 0 } }, parsed);
+		assert.equal(message!.usage.cost.total, 0);
+		assert.equal(message!.usage.cost.totalFromProvider, true);
+	});
+
+	it("keeps the catalog estimate when the cost is missing or malformed", async () => {
+		const estimate = (100 * 4 + 10 * 20) / 1e6;
+		for (const cost of [undefined, null, {}, { usd: -1, diem: 0 }, { usd: "0.1", diem: 0 }, { usd: 0, diem: Number.NaN }, 0.5]) {
+			const parsed = parsedUsage({ input: 100, output: 10, totalTokens: 110 });
+			const raw = cost === undefined ? { usage: { prompt_tokens: 100 } } : { usage: { prompt_tokens: 100 }, cost };
+			const message = await run(raw, parsed);
+			near(message!.usage.cost.total, estimate);
+			assert.notEqual(message!.usage.cost.totalFromProvider, true, `cost ${JSON.stringify(cost)}`);
+		}
 	});
 
 	it("still passes every provider chunk to the caller's onProviderStreamEvent", async () => {
