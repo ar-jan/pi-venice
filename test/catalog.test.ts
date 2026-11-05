@@ -25,8 +25,37 @@ function veniceModel(
 }
 
 describe("toPiModel", () => {
-	it("omits E2EE models, which this provider cannot serve", () => {
-		assert.equal(toPiModel(veniceModel({ supportsE2EE: true }) as never), undefined);
+	it("keeps E2EE-capable models and labels them TEE, not E2EE", () => {
+		// Without E2EE headers Venice runs them in TEE-only mode, so plain requests work.
+		const model = toPiModel(
+			veniceModel({ supportsE2EE: true, supportsTeeAttestation: true }, "e2ee-glm-5-3-flash") as never,
+		);
+		assert.equal(model?.id, "e2ee-glm-5-3-flash");
+		assert.equal(model?.name, "Test Model (private, TEE)");
+		assert.doesNotMatch(model!.name, /E2EE/i);
+	});
+
+	it("omits a model whose tool calling is verified broken", () => {
+		const entry = veniceModel({ supportsE2EE: true, supportsTeeAttestation: true, supportsVision: true }, "e2ee-qwen3-vl-30b-a3b-p");
+		assert.equal(toPiModel(entry as never), undefined);
+	});
+
+	it("does not offer off via a listed none effort in TEE-only mode", () => {
+		// Venice rejects every way of disabling reasoning on these models with HTTP 400.
+		const model = toPiModel(
+			veniceModel(
+				{
+					supportsE2EE: true,
+					supportsTeeAttestation: true,
+					supportsReasoning: true,
+					supportsReasoningEffort: true,
+					reasoningEffortOptions: ["none", "low", "medium", "high"],
+				},
+				"e2ee-glm-5-3-p",
+			) as never,
+		);
+		assert.equal(model?.thinkingLevelMap?.off, null);
+		assert.deepEqual(getSupportedThinkingLevels(model!), ["low", "medium", "high"]);
 	});
 
 	it("keeps models that support tool calling", () => {

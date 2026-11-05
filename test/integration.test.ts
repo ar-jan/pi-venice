@@ -29,6 +29,7 @@ import { Keyring } from "../extensions/venice/keyring.ts";
 
 interface ReceivedRequest {
 	key: string;
+	headers: IncomingMessage["headers"];
 	body: Record<string, unknown>;
 }
 
@@ -103,6 +104,7 @@ before(async () => {
 		const raw = await readBody(req);
 		const request: ReceivedRequest = {
 			key: (req.headers.authorization ?? "").replace(/^Bearer\s+/i, ""),
+			headers: req.headers,
 			body: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
 		};
 		received.push(request);
@@ -345,6 +347,48 @@ describe("request body through the real adapter", () => {
 
 		const toolResult = messagesSent().find((message) => message.role === "tool")!;
 		assert.equal(toolResult.content, "ELFbinarytail");
+	});
+});
+
+describe("TEE models through the real adapter", () => {
+	/** E2EE-capable, like every TEE model in Venice's catalog; this provider runs them TEE-only. */
+	const tee = (id: string, capabilities: Record<string, unknown> = {}) =>
+		catalogModel(id, { supportsE2EE: true, supportsTeeAttestation: true, supportsReasoning: true, ...capabilities });
+
+	it("sends plaintext requests without E2EE headers", async () => {
+		const model = tee("e2ee-deepseek-v4-flash");
+		const { message } = await run(veniceApi(new Keyring()), model, toolLoopContext(model, "# README"), {
+			apiKey: "key-1",
+			sessionId: "session-1",
+		});
+
+		assert.equal(message.stopReason, "stop");
+		const { headers, body } = received[0]!;
+		// Venice switches to E2EE only when these headers come with client-encrypted messages.
+		assert.deepEqual(
+			Object.keys(headers).filter((name) => name.startsWith("x-venice-tee-")),
+			[],
+		);
+		assert.equal(body.model, "e2ee-deepseek-v4-flash");
+		assert.ok(Array.isArray(body.tools) && body.tools.length === 1);
+		const user = messagesSent().find((entry) => entry.role === "user")!;
+		assert.equal(user.content, "Read README.md");
+		assert.deepEqual(body.venice_parameters, { include_venice_system_prompt: false });
+	});
+
+	it("never sends the none effort that Venice rejects in TEE-only mode", async () => {
+		const model = tee("e2ee-glm-5-3-p", { supportsReasoningEffort: true, reasoningEffortOptions: ["none", "low", "medium", "high"] });
+		const api = veniceApi(new Keyring());
+		// No level: the model's default effort, rather than reasoning_effort "none".
+		await run(api, model, userContext(), { apiKey: "key-1" });
+		// pi's session clamps a stored "off" to the lowest offered level before it sends a request.
+		await run(api, model, userContext(), { apiKey: "key-1", reasoning: "low" });
+
+		assert.equal("reasoning_effort" in received[0]!.body, false);
+		assert.equal(received[1]!.body.reasoning_effort, "low");
+		for (const { body } of received) {
+			assert.deepEqual(body.venice_parameters, { include_venice_system_prompt: false });
+		}
 	});
 });
 

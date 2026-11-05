@@ -4,8 +4,10 @@
  * - Auth: `/login venice` (stored in auth.json) or the VENICE_API_KEY environment variable.
  *   Logging in again adds the next key as a fallback (VENICE_API_KEY_2, ...); see keyring.ts.
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
- *   support tool calling, and cached in models-store.json for offline use.
- * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier.
+ *   support tool calling, and cached in models-store.json for offline use. E2EE-capable models are
+ *   included and run in TEE-only mode: requests reach Venice as plaintext (see toPiModel).
+ * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier, plus
+ *   "TEE" for models that run in an attested enclave.
  * - Requests disable Venice's own system prompt, carry a per-session `prompt_cache_key`, turn
  *   thinking off with `venice_parameters.disable_thinking` on the models verified to honor it, and
  *   place Claude cache breakpoints on the system prompt and the last turn (see request.ts).
@@ -90,6 +92,8 @@ interface VeniceModel {
 	};
 }
 
+type VeniceCapabilities = NonNullable<NonNullable<VeniceModel["model_spec"]>["capabilities"]>;
+
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -135,6 +139,26 @@ const DISABLE_THINKING_MODELS = new Set([
 	"zai-org-glm-4.7",
 ]);
 
+// Models the catalog lists with tool calling whose backend rejects every request that carries tools,
+// verified against the live API. e2ee-qwen3-vl-30b-a3b-p answers HTTP 400 "\"auto\" tool choice
+// requires --enable-auto-tool-choice and --tool-call-parser to be set" (and the equivalent for
+// "required" and a named tool); only tool_choice "none" works. Pi sends its tools with every agent
+// request, so such a model would fail every turn. Re-verify when Venice changes these models.
+const BROKEN_TOOL_CALLING_MODELS = new Set(["e2ee-qwen3-vl-30b-a3b-p"]);
+
+/**
+ * Whether a listed "none" effort really turns reasoning off. Not on E2EE-capable models, which this
+ * provider runs in TEE-only mode: verified against the live API on every such model that lists
+ * "none" (e2ee-glm-5-2-p, e2ee-glm-5-3-p, e2ee-kimi-k3-p), each way of disabling reasoning
+ * (`reasoning_effort: "none"`, `reasoning.enabled: false`, `venice_parameters.disable_thinking`)
+ * fails with HTTP 400 "reasoning.max_tokens must be positive", while every listed effort level works.
+ * Offering "off" there would fail each request, so it stays unavailable. Re-verify when Venice
+ * changes these models.
+ */
+function honorsNoneEffort(caps: VeniceCapabilities): boolean {
+	return caps.supportsE2EE !== true;
+}
+
 function thinkingConfig(model: VeniceModel): Pick<Model<Api>, "reasoning" | "thinkingLevelMap"> & {
 	supportsReasoningEffort: boolean;
 } {
@@ -143,10 +167,16 @@ function thinkingConfig(model: VeniceModel): Pick<Model<Api>, "reasoning" | "thi
 		return { reasoning: false, supportsReasoningEffort: false };
 	}
 	const options = caps.supportsReasoningEffort ? (caps.reasoningEffortOptions ?? []) : [];
-	// "none" is an effort Venice accepts itself. Otherwise "off" is offered only for verified
-	// models, and without a map value: pi then sends no reasoning_effort, and the request layer adds
-	// venice_parameters.disable_thinking (see request.ts). null keeps it unsupported everywhere else.
-	const off = options.includes("none") ? "none" : DISABLE_THINKING_MODELS.has(model.id) ? undefined : null;
+	// "none" is an effort Venice accepts itself (except in TEE-only mode, see honorsNoneEffort).
+	// Otherwise "off" is offered only for verified models, and without a map value: pi then sends no
+	// reasoning_effort, and the request layer adds venice_parameters.disable_thinking (see
+	// request.ts). null keeps it unsupported everywhere else.
+	const off =
+		options.includes("none") && honorsNoneEffort(caps)
+			? "none"
+			: DISABLE_THINKING_MODELS.has(model.id)
+				? undefined
+				: null;
 	if (options.length === 0) {
 		// No effort control: "medium" stays unset, which pi reads as a single "model default" level.
 		return {
@@ -175,9 +205,12 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 	if (!spec || !caps) return undefined;
 	if (model.type !== undefined && model.type !== "text") return undefined;
 	if (!caps.supportsFunctionCalling || spec.offline) return undefined;
-	// E2EE models need client-side encryption that this provider does not implement, so they
-	// cannot serve requests from Pi even though they appear in the catalog.
-	if (caps.supportsE2EE) return undefined;
+	if (BROKEN_TOOL_CALLING_MODELS.has(model.id)) return undefined;
+	// E2EE-capable models stay. Venice runs them in TEE-only mode unless a request carries its E2EE
+	// headers (`X-Venice-TEE-*`) with client-encrypted messages, which this provider never sends: the
+	// model runs in an attested enclave, but the request reaches Venice as plaintext like any other.
+	// Their names are therefore tagged "TEE" below, never "E2EE". The extension does not verify the
+	// enclave's attestation itself; the tag reflects Venice's catalog.
 
 	const now = Date.now();
 	const removesAt = spec.deprecation?.removesAt ?? spec.deprecation?.date;

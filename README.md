@@ -74,11 +74,14 @@ Then run `/reload` in Pi (or start a new session).
 ## Features
 
 - Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
-support tool calling and do not require end-to-end encryption (E2EE), and cached in
-`models-store.json`.
+  support tool calling, and cached in `models-store.json`. Venice's E2EE-capable models are included
+  and run in TEE-only mode (see [TEE models](#tee-models)).
+- One catalog model is left out because its tool calling fails on every request:
+  `e2ee-qwen3-vl-30b-a3b-p` (see [TEE models](#tee-models)).
 - Contradictory catalog limits (max output at or above the context window) are clamped so an
   unknown output cap cannot consume the whole window; current Venice models are unaffected.
-- Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier.
+- Every model name is marked `(private)` or `(anonymized)` after Venice's privacy tier, plus `TEE`
+  for models that run in an attested enclave, e.g. `GLM 5.3 Flash (private, TEE)`.
 - Reasoning models send the system prompt with the OpenAI `developer` role, which Venice supports.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
   prefix (omitted when prompt caching is set to `none`).
@@ -97,6 +100,30 @@ support tool calling and do not require end-to-end encryption (E2EE), and cached
   replays with every request.
 - Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on a
   short list of models verified to honor `venice_parameters.disable_thinking` (see [Thinking](#thinking)).
+
+## TEE models
+
+Venice's `e2ee-*` models run inside a Trusted Execution Environment (Intel TDX, NVIDIA confidential
+computing) with remote attestation. The same model ID serves two modes: E2EE, where the client
+encrypts its messages to the enclave and sends Venice's `X-Venice-TEE-*` headers, and TEE-only, an
+ordinary request. This extension does not implement the E2EE protocol, so it always uses TEE-only
+mode: inference runs in the enclave, but prompts reach the Venice API as plaintext, as with any other
+model. The names are therefore tagged `TEE`, never `E2EE`; the IDs keep Venice's `e2ee-` prefix. The
+extension does not check the enclave's attestation itself (Venice serves it at
+`GET /tee/attestation`); the tag reflects Venice's catalog.
+
+Measured against the live API, two exceptions apply:
+
+- `e2ee-qwen3-vl-30b-a3b-p` is not listed. Its backend rejects every request that carries tools
+  (HTTP 400, "\"auto\" tool choice requires --enable-auto-tool-choice ..."), and pi sends its tools
+  with every agent request.
+- `off` is not offered on TEE models even where Venice lists a `"none"` effort (`e2ee-glm-5-2-p`,
+  `e2ee-glm-5-3-p`, `e2ee-kimi-k3-p`): every way of disabling reasoning fails there with HTTP 400
+  ("reasoning.max_tokens must be positive"), while each listed effort level works. Selecting `off`
+  falls back to the lowest offered level.
+
+TEE models can be slower than their regular counterparts and sometimes run out of capacity (HTTP
+429 or 504); pi retries those errors.
 
 ## Cost
 
