@@ -71,6 +71,14 @@ pi update git:github.com/ar-jan/pi-venice
 
 Then run `/reload` in Pi (or start a new session).
 
+Model details derived from the catalog, such as which thinking levels a model offers, are cached in
+`models-store.json`, and pi selects the thinking level against that cache. Interactive pi re-fetches
+the Venice catalog in the background on startup (and when `/model` opens), so an update to these
+details applies from the next start after that. Print mode (`pi -p`) only reads the cache, and
+`pi update --models` does not refresh extension catalogs, so start pi interactively once after
+updating. Until then, a level the cached entry lacks (for example `off`) is clamped to the nearest
+supported one.
+
 ## Features
 
 - Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
@@ -98,8 +106,9 @@ Then run `/reload` in Pi (or start a new session).
   HTTP 400, so a tool result carrying binary bytes would otherwise break the session from then on:
   both reading a binary file and a program printing decoded bytes end up in the transcript that Pi
   replays with every request.
-- Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on a
-  short list of models verified to honor `venice_parameters.disable_thinking` (see [Thinking](#thinking)).
+- Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on short
+  lists of models verified to honor `venice_parameters.disable_thinking` or an unlisted `"none"`
+  (see [Thinking](#thinking)).
 
 ## TEE models
 
@@ -170,9 +179,18 @@ reports zero reasoning tokens). For those, `off` is offered and the request carr
 `venice_parameters.disable_thinking: true` instead of a `reasoning_effort`:
 
 `abliteration-abliterated-model-large-flash`, `claude-opus-4-6`, `claude-opus-4-7`,
-`gemini-3-5-flash-lite`, `grok-4-20`, `minimax-m3-preview`, `qwen-3-6-plus`, `qwen-3-7-max`,
+`claude-opus-4-8`, `gemini-3-5-flash-lite`, `grok-4-20`, `minimax-m3-1-flash`,
+`minimax-m3-preview`, `nvidia-nemotron-3-5-super-vl-120b-a12b`, `qwen-3-6-plus`, `qwen-3-7-max`,
 `qwen-3-7-plus`, `qwen-3-8-flash`, `qwen3-6-35b-a3b`, `qwen3-235b-a22b-thinking-2507`,
 `seed-2-1-turbo`, `zai-org-glm-4.6`, `zai-org-glm-4.7`.
+
+A few models do not list `"none"` but were verified to stop reasoning when sent it anyway, while
+the toggle only hides their reasoning. There `off` sends `reasoning_effort: "none"`:
+`kimi-k2-7-code`.
+
+Models that reason in the visible answer instead once thinking is off (`claude-opus-4-5`,
+`claude-sonnet-4-6`, and `minimax-m25` with `"none"`) do not offer `off`, since it would not shorten
+the reply.
 
 Thinking levels otherwise come from the catalog: a model that accepts effort options gets exactly
 those levels, while a model without effort control gets one level meaning "model default".

@@ -101,6 +101,25 @@ describe("toPiModel", () => {
 		assert.deepEqual(getSupportedThinkingLevels(model!), ["low", "high"]);
 	});
 
+	it("uses none for off on a model verified to honor an unlisted none effort", () => {
+		const model = toPiModel(
+			veniceModel(
+				{ supportsReasoning: true, supportsReasoningEffort: true, reasoningEffortOptions: ["low", "medium", "high"] },
+				"kimi-k2-7-code",
+			) as never,
+		);
+		assert.equal(model?.thinkingLevelMap?.off, "none");
+		assert.equal(model?.compat?.supportsReasoningEffort, true);
+		assert.deepEqual(getSupportedThinkingLevels(model!), ["off", "low", "medium", "high"]);
+	});
+
+	it("does not offer an unlisted none where pi would send no effort", () => {
+		// Without effort control pi sends no reasoning_effort, so "off" would change nothing.
+		const model = toPiModel(veniceModel({ supportsReasoning: true, supportsReasoningEffort: false }, "kimi-k2-7-code") as never);
+		assert.equal(model?.thinkingLevelMap?.off, null);
+		assert.deepEqual(getSupportedThinkingLevels(model!), ["medium"]);
+	});
+
 	it("uses none for off when the catalog lists that effort", () => {
 		const model = toPiModel(
 			veniceModel({ supportsReasoning: true, supportsReasoningEffort: true, reasoningEffortOptions: ["none", "high"] }) as never,

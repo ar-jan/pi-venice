@@ -8,8 +8,9 @@
  *
  * Thinking is turned off with `venice_parameters.disable_thinking` for the models whose entry
  * offers "off" without a wire value (see DISABLE_THINKING_MODELS in index.ts). Models that list a
- * `"none"` effort keep sending `reasoning_effort: "none"`, which Venice honors natively; on the
- * rest the toggle only strips the reasoning text while still billing it, so they do not offer "off".
+ * `"none"` effort, or are verified to honor it unlisted (NONE_EFFORT_MODELS), keep sending
+ * `reasoning_effort: "none"`; on the rest the toggle only strips the reasoning text while still
+ * billing it, so they do not offer "off".
  *
  * Venice reports cache writes as `prompt_tokens_details.cache_creation_input_tokens`, while pi's
  * OpenAI-completions adapter reads `prompt_tokens_details.cache_write_tokens`. The adapter therefore

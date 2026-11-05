@@ -120,14 +120,19 @@ function modelLimits(spec: VeniceModel["model_spec"]): { contextWindow: number; 
 // their completion tokens drop to the answer alone (or Venice reports reasoning_tokens 0).
 // On every other such model Venice only strips the reasoning text while still generating and
 // billing it, so offering "off" there would promise something the request does not deliver.
+// Models that instead write their reasoning into the visible answer once thinking is off
+// (claude-opus-4-5, claude-sonnet-4-6) are left out too: "off" would not shorten the reply.
 // Re-verify when Venice changes these models or moves them to another backend.
 const DISABLE_THINKING_MODELS = new Set([
 	"abliteration-abliterated-model-large-flash",
 	"claude-opus-4-6",
 	"claude-opus-4-7",
+	"claude-opus-4-8",
 	"gemini-3-5-flash-lite",
 	"grok-4-20",
+	"minimax-m3-1-flash",
 	"minimax-m3-preview",
+	"nvidia-nemotron-3-5-super-vl-120b-a12b",
 	"qwen-3-6-plus",
 	"qwen-3-7-max",
 	"qwen-3-7-plus",
@@ -138,6 +143,13 @@ const DISABLE_THINKING_MODELS = new Set([
 	"zai-org-glm-4.6",
 	"zai-org-glm-4.7",
 ]);
+
+// Models with effort control that do not list "none" but were verified against the live API to
+// stop reasoning when sent `reasoning_effort: "none"` anyway, while `disable_thinking` only hides
+// their reasoning (kimi-k2-7-code keeps billing about 190 reasoning tokens with it). "off" maps to
+// "none" there, which pi sends itself. Left out: minimax-m25, which with "none" sometimes reasons in
+// the visible answer until the token limit. Re-verify when Venice changes these models.
+const NONE_EFFORT_MODELS = new Set(["kimi-k2-7-code"]);
 
 // Models the catalog lists with tool calling whose backend rejects every request that carries tools,
 // verified against the live API. e2ee-qwen3-vl-30b-a3b-p answers HTTP 400 "\"auto\" tool choice
@@ -167,16 +179,15 @@ function thinkingConfig(model: VeniceModel): Pick<Model<Api>, "reasoning" | "thi
 		return { reasoning: false, supportsReasoningEffort: false };
 	}
 	const options = caps.supportsReasoningEffort ? (caps.reasoningEffortOptions ?? []) : [];
-	// "none" is an effort Venice accepts itself (except in TEE-only mode, see honorsNoneEffort).
+	// "none" is an effort Venice accepts itself (except in TEE-only mode, see honorsNoneEffort), and
+	// on NONE_EFFORT_MODELS even unlisted; pi only sends an effort where the model has effort control.
 	// Otherwise "off" is offered only for verified models, and without a map value: pi then sends no
 	// reasoning_effort, and the request layer adds venice_parameters.disable_thinking (see
 	// request.ts). null keeps it unsupported everywhere else.
-	const off =
-		options.includes("none") && honorsNoneEffort(caps)
-			? "none"
-			: DISABLE_THINKING_MODELS.has(model.id)
-				? undefined
-				: null;
+	const acceptsNone =
+		(options.includes("none") && honorsNoneEffort(caps)) ||
+		(options.length > 0 && NONE_EFFORT_MODELS.has(model.id));
+	const off = acceptsNone ? "none" : DISABLE_THINKING_MODELS.has(model.id) ? undefined : null;
 	if (options.length === 0) {
 		// No effort control: "medium" stays unset, which pi reads as a single "model default" level.
 		return {

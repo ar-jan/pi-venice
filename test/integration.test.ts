@@ -294,6 +294,19 @@ describe("request body through the real adapter", () => {
 		assert.deepEqual(body.venice_parameters, { include_venice_system_prompt: false });
 	});
 
+	it("turns thinking off with reasoning_effort none on a model verified to honor it unlisted", async () => {
+		const model = catalogModel("kimi-k2-7-code", {
+			supportsReasoning: true,
+			supportsReasoningEffort: true,
+			reasoningEffortOptions: ["low", "medium", "high"],
+		});
+		await run(veniceApi(new Keyring()), model, userContext(), { apiKey: "key-1" });
+
+		const { body } = received[0]!;
+		assert.equal(body.reasoning_effort, "none");
+		assert.deepEqual(body.venice_parameters, { include_venice_system_prompt: false });
+	});
+
 	it("merges user venice_parameters layers with the defaults", async () => {
 		const model = {
 			...kimi(),
