@@ -41,7 +41,7 @@ import {
 	veniceApiKeyAuth,
 	withKeyRotation,
 } from "./keyring.ts";
-import { withVeniceRequestDefaults } from "./request.ts";
+import { VENICE_MAX_IMAGES_PER_REQUEST, withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
 const BASE_URL = "https://api.venice.ai/api/v1";
@@ -246,7 +246,16 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 		provider: PROVIDER_ID,
 		baseUrl: BASE_URL,
 		input: vision ? ["text", "image"] : ["text"],
-		...(vision && maxImages ? { inputLimits: { images: { maxPerMessage: maxImages } } } : {}),
+		...(vision
+			? {
+					inputLimits: {
+						images: {
+							...(maxImages ? { maxPerMessage: maxImages } : {}),
+							maxPerRequest: VENICE_MAX_IMAGES_PER_REQUEST,
+						},
+					},
+				}
+			: {}),
 		cost: {
 			input: usd(pricing.input),
 			output: usd(pricing.output),

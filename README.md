@@ -106,9 +106,32 @@ supported one.
   HTTP 400, so a tool result carrying binary bytes would otherwise break the session from then on:
   both reading a binary file and a program printing decoded bytes end up in the transcript that Pi
   replays with every request.
+- The oldest images are replaced with a text placeholder once a request would exceed Venice's
+  64-image limit (see [Images](#images)).
 - Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on short
   lists of models verified to honor `venice_parameters.disable_thinking` or an unlisted `"none"`
   (see [Thinking](#thinking)).
+
+## Images
+
+Venice accepts at most 64 images across one request. This limit is not in the Models API or
+the docs; it shows up only as an error. (`capabilities.maxImages`, usually 10, behaves as a
+per-message limit.) Pi replays the whole transcript with every request, so every image read with
+`read` or attached by the user stays in later requests. Once the history holds 65 images, Venice
+rejects the request with HTTP 400 `invalid_media: Request exceeds media count limit` (a follow-up
+reports `Too many images: 65 (max 64)`), and the session stays stuck because the same history is
+sent again.
+
+The extension therefore replaces the oldest images with
+`(image omitted: Venice accepts at most 64 images per request)` before sending. It omits them in
+blocks of 32 rather than one at a time: the same images stay omitted until the next block is
+needed, so the request prefix stays the same and the prompt cache keeps hitting. Dropping only the
+overflow would change an early message on every new image and miss the cache for nearly the whole
+request each time. Between 33 and 64 of the newest images are sent. The session itself keeps every
+image, so the transcript and UI are unchanged.
+
+To keep images out of a long session, have a subagent do screenshot-heavy work and report back in
+text, or run `/compact`, which summarizes older messages as text.
 
 ## TEE models
 

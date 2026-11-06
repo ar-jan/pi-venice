@@ -361,6 +361,38 @@ describe("request body through the real adapter", () => {
 		const toolResult = messagesSent().find((message) => message.role === "tool")!;
 		assert.equal(toolResult.content, "ELFbinarytail");
 	});
+
+	it("advertises the request image limit and omits the oldest images over it", async () => {
+		const model = catalogModel("vision-model", { supportsVision: true, supportsMultipleImages: true, maxImages: 10 });
+		assert.deepEqual(model.inputLimits, { images: { maxPerMessage: 10, maxPerRequest: 64 } });
+		const messages = Array.from({ length: 65 }, (_, i): Context["messages"][number] => ({
+			role: "user",
+			content: [
+				{ type: "text", text: `screenshot ${i}` },
+				{ type: "image", data: "AAAA", mimeType: "image/png" },
+			],
+			timestamp: i,
+		}));
+
+		await run(veniceApi(new Keyring()), model, { systemPrompt: "You are a coding assistant.", messages }, { apiKey: "key-1" });
+
+		const sent = messagesSent();
+		const images = sent.flatMap((message) =>
+			Array.isArray(message.content) ? message.content.filter((part) => (part as { type?: string }).type === "image_url") : [],
+		);
+		assert.equal(images.length, 33);
+		const contentOf = (n: number) =>
+			sent.find(
+				(message) =>
+					Array.isArray(message.content) &&
+					message.content.some((part) => (part as { text?: string }).text === `screenshot ${n}`),
+			)?.content;
+		assert.deepEqual(contentOf(31), [
+			{ type: "text", text: "screenshot 31" },
+			{ type: "text", text: "(image omitted: Venice accepts at most 64 images per request)" },
+		]);
+		assert.equal((contentOf(32) as { type: string }[])[1]!.type, "image_url");
+	});
 });
 
 describe("TEE models through the real adapter", () => {

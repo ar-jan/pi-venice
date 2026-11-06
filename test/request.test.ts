@@ -9,7 +9,7 @@ import type {
 	StreamOptions,
 	Usage,
 } from "@earendil-works/pi-ai";
-import { applyVeniceDefaults, withVeniceRequestDefaults } from "../extensions/venice/request.ts";
+import { applyVeniceDefaults, imagesToOmit, withVeniceRequestDefaults } from "../extensions/venice/request.ts";
 
 const body = (extra: Record<string, unknown> = {}) => ({ model: "kimi-k3", messages: [], ...extra });
 
@@ -134,6 +134,62 @@ describe("NUL bytes in messages", () => {
 		const messages = [{ role: "user", content: "a\u0001b\u001bc\ufffdd" }];
 		const result = applyVeniceDefaults(body({ messages }), {}) as { messages: unknown };
 		assert.equal(result.messages, messages);
+	});
+});
+
+describe("image limit", () => {
+	const image = (n: number) => ({ type: "image_url", image_url: { url: `data:image/png;base64,${n}` } });
+	const omitted = (max: number) => ({ type: "text", text: `(image omitted: Venice accepts at most ${max} images per request)` });
+	const screenshots = (count: number) =>
+		Array.from({ length: count }, (_, i) => ({ role: "user", content: [{ type: "text", text: `screenshot ${i}` }, image(i)] }));
+	const messagesOf = (payload: unknown) => (payload as { messages: { content: unknown[] }[] }).messages;
+	const imagesIn = (messages: { content: unknown[] }[]) =>
+		messages.flatMap((message) =>
+			Array.isArray(message.content) ? message.content.filter((part) => (part as { type?: string }).type === "image_url") : [],
+		);
+
+	it("omits the oldest images in a block of 32 once over 64", () => {
+		const messages = screenshots(65);
+		const snapshot = structuredClone(messages);
+
+		const result = messagesOf(applyVeniceDefaults(body({ messages }), {}));
+
+		assert.equal(imagesIn(result).length, 33);
+		assert.deepEqual(result[0]!.content, [{ type: "text", text: "screenshot 0" }, omitted(64)]);
+		assert.deepEqual(result[31]!.content, [{ type: "text", text: "screenshot 31" }, omitted(64)]);
+		assert.deepEqual(result[32]!.content, [{ type: "text", text: "screenshot 32" }, image(32)]);
+		assert.deepEqual(result.at(-1)!.content, [{ type: "text", text: "screenshot 64" }, image(64)]);
+		assert.deepEqual(messages, snapshot);
+	});
+
+	it("keeps the same images omitted until the next block is needed", () => {
+		assert.equal(imagesToOmit(64, 64), 0);
+		assert.equal(imagesToOmit(65, 64), 32);
+		assert.equal(imagesToOmit(96, 64), 32);
+		assert.equal(imagesToOmit(97, 64), 64);
+
+		// The prefix up to the newest image of the shorter request is identical, so it stays cacheable.
+		const shorter = messagesOf(applyVeniceDefaults(body({ messages: screenshots(65) }), {}));
+		const longer = messagesOf(applyVeniceDefaults(body({ messages: screenshots(96) }), {}));
+		assert.deepEqual(longer.slice(0, shorter.length), shorter);
+		assert.equal(imagesIn(longer).length, 64);
+	});
+
+	it("uses the limit from the request context, with blocks no larger than the limit", () => {
+		const messages = Array.from({ length: 3 }, (_, i) => ({ role: "user", content: [image(i)] }));
+
+		const result = messagesOf(applyVeniceDefaults(body({ messages }), { maxImagesPerRequest: 2 }));
+
+		assert.deepEqual(
+			result.map((message) => message.content),
+			[[omitted(2)], [omitted(2)], [image(2)]],
+		);
+	});
+
+	it("leaves a request within the limit by reference", () => {
+		const messages = Array.from({ length: 64 }, (_, i) => ({ role: "user", content: [image(i)] }));
+		const result = messagesOf(applyVeniceDefaults(body({ messages }), {}));
+		assert.equal(result, messages);
 	});
 });
 

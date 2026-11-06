@@ -34,6 +34,14 @@
  * transcript each time. Tool results are the usual source, in either of two ways: a command that
  * reads a binary file (`cat` of an executable), or a program whose stdout carries raw bytes (e.g.
  * printing a decoded blob). Such bytes are dropped from `messages` before sending.
+ *
+ * Venice accepts at most 64 images across a request. Neither the Models API nor the docs state this;
+ * it is known only from the errors: HTTP 400 "invalid_media: Request exceeds media count limit",
+ * then "Too many images: 65 (max 64)". (`capabilities.maxImages`, usually 10, behaves as a per-message
+ * limit.) Pi replays every image ever read or attached on every later request, so a screenshot-driven
+ * session fails each turn once it holds 65 images. The oldest images are therefore replaced with a
+ * text placeholder before sending (see limitImages), in blocks rather than one at a time so the
+ * request prefix, and with it the prompt cache, stays stable between evictions.
  */
 
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -54,6 +62,12 @@ import type {
 /** Venice keeps the first 64 characters, like OpenAI. */
 const PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 
+/** Venice rejects a request carrying more images than this, across all messages (observed, undocumented). */
+export const VENICE_MAX_IMAGES_PER_REQUEST = 64;
+
+/** Images over the limit are omitted in blocks of this size (capped at the limit itself). */
+const IMAGE_OMIT_BLOCK = 32;
+
 const NUL = "\u0000";
 
 /** pi-ai's `clampThinkingLevel`, passed in so this module does not import the model catalog. */
@@ -69,6 +83,8 @@ export interface VeniceRequestContext {
 	disableThinking?: boolean;
 	/** The model needs explicit cache breakpoints (Claude); skipped when prompt caching is off. */
 	cacheBreakpoints?: boolean;
+	/** Images allowed across the request; defaults to VENICE_MAX_IMAGES_PER_REQUEST. */
+	maxImagesPerRequest?: number;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -343,11 +359,60 @@ function withoutNullBytes(value: unknown): unknown {
 	return value;
 }
 
+function isImagePart(part: unknown): boolean {
+	return isPlainObject(part) && (part.type === "image_url" || part.type === "image");
+}
+
+/** The number of oldest images to omit so that at most `maxImages` remain. */
+export function imagesToOmit(total: number, maxImages: number): number {
+	if (total <= maxImages) return 0;
+	const block = Math.max(1, Math.min(IMAGE_OMIT_BLOCK, maxImages));
+	return Math.min(total, Math.ceil((total - maxImages) / block) * block);
+}
+
+/**
+ * Replace the oldest images with a text placeholder so at most `maxImages` remain.
+ *
+ * Dropping exactly the overflow would turn a different image into a placeholder each time a new one
+ * arrives. That image sits early in the transcript, so the prefix would change and nearly the whole
+ * request would miss the prompt cache on every such turn. Images are instead omitted in blocks (see
+ * imagesToOmit): the count depends only on the total, so the same images stay omitted, and the prefix
+ * stays cacheable, until the next block is needed. Between `maxImages - block + 1` and `maxImages`
+ * images are sent. Messages and content arrays are copied on write; the input is not mutated.
+ */
+function limitImages(messages: unknown[], maxImages: number): unknown[] {
+	let total = 0;
+	for (const message of messages) {
+		if (isPlainObject(message) && Array.isArray(message.content)) {
+			for (const part of message.content) if (isImagePart(part)) total++;
+		}
+	}
+	let remaining = imagesToOmit(total, maxImages);
+	if (remaining === 0) return messages;
+
+	const placeholder = { type: "text", text: `(image omitted: Venice accepts at most ${maxImages} images per request)` };
+	const result = [...messages];
+	for (let i = 0; i < messages.length && remaining > 0; i++) {
+		const message = messages[i];
+		if (!isPlainObject(message) || !Array.isArray(message.content)) continue;
+		let content: unknown[] | undefined;
+		for (let j = 0; j < message.content.length && remaining > 0; j++) {
+			if (!isImagePart(message.content[j])) continue;
+			content ??= [...message.content];
+			content[j] = { ...placeholder };
+			remaining--;
+		}
+		if (content) result[i] = { ...message, content };
+	}
+	return result;
+}
+
 /**
  * Add Venice defaults to a chat completions body:
  * - `messages`: NUL bytes dropped (see withoutNullBytes), so a tool result carrying binary bytes —
  *   read from a file or printed by a program — cannot make Venice reject the session's every later
- *   request.
+ *   request. The oldest images over the request limit are replaced with a text placeholder (see
+ *   limitImages), so a long screenshot session does not fail every later request.
  * - `venice_parameters`: `include_venice_system_prompt: false` and, at thinking level off,
  *   `disable_thinking: true`, then each user layer key by key, then the body's own value, so later
  *   layers win per key. A non-object value in the body is left for Venice to reject; non-object
@@ -364,7 +429,9 @@ export function applyVeniceDefaults(payload: unknown, context: VeniceRequestCont
 	const messages = body.messages;
 	if (Array.isArray(messages)) {
 		const clean = withoutNullBytes(messages);
-		if (clean !== messages) body = { ...body, messages: clean };
+		const maxImages = context.maxImagesPerRequest ?? VENICE_MAX_IMAGES_PER_REQUEST;
+		const limited = Array.isArray(clean) ? limitImages(clean, maxImages) : clean;
+		if (limited !== messages) body = { ...body, messages: limited };
 	}
 
 	const veniceParameters = body.venice_parameters;
@@ -416,6 +483,7 @@ function withDefaults<T extends StreamOptions>(
 				veniceParameterLayers: layers,
 				disableThinking,
 				cacheBreakpoints: usesExplicitCacheBreakpoints(model),
+				maxImagesPerRequest: model.inputLimits?.images?.maxPerRequest,
 			});
 			// Extension `before_provider_request` hooks arrive here and see the prepared body.
 			const replaced = await callerOnPayload?.(prepared, model);
