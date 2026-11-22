@@ -13,6 +13,8 @@
  *   place Claude cache breakpoints on the system prompt and the last turn (see request.ts).
  * - Usage: cache writes are moved onto `cacheWrite`, and the total cost is what Venice billed
  *   (see request.ts).
+ * - `/venice-refresh-models` refetches the catalog on demand and applies it to the current model
+ *   (see refresh.ts).
  */
 
 import {
@@ -41,6 +43,7 @@ import {
 	veniceApiKeyAuth,
 	withKeyRotation,
 } from "./keyring.ts";
+import { registerRefreshCommand } from "./refresh.ts";
 import { VENICE_MAX_IMAGES_PER_REQUEST, withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
@@ -340,6 +343,8 @@ export default function (pi: ExtensionAPI) {
 	const hasStoredCredential = async () =>
 		registry ? isStoredCredentialAuth(await registry.getProviderAuth(PROVIDER_ID)) : undefined;
 
+	// Successful catalog requests, so /venice-refresh-models can tell whether its refresh fetched.
+	let catalogFetches = 0;
 	pi.registerProvider(
 		createProvider({
 			id: PROVIDER_ID,
@@ -347,13 +352,17 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: BASE_URL,
 			auth: { apiKey: veniceApiKeyAuth(hasStoredCredential) },
 			models: [],
-			fetchModels: (context) => {
+			fetchModels: async (context) => {
 				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
-				return fetchVeniceModels(key, context.signal);
+				const models = await fetchVeniceModels(key, context.signal);
+				catalogFetches++;
+				return models;
 			},
 			api: veniceApi(keyring),
 		}),
 	);
+
+	registerRefreshCommand(pi, PROVIDER_ID, () => catalogFetches);
 
 	pi.registerCommand("venice-key", {
 		description: "Select the active Venice API key",

@@ -73,17 +73,38 @@ Then run `/reload` in Pi (or start a new session).
 
 Model details derived from the catalog, such as which thinking levels a model offers, are cached in
 `models-store.json`, and pi selects the thinking level against that cache. Interactive pi re-fetches
-the Venice catalog in the background on startup (and when `/model` opens), so an update to these
-details applies from the next start after that. Print mode (`pi -p`) only reads the cache, and
-`pi update --models` does not refresh extension catalogs, so start pi interactively once after
-updating. Until then, a level the cached entry lacks (for example `off`) is clamped to the nearest
-supported one.
+the Venice catalog in the background on startup (and when `/model` opens) but keeps the model it
+already selected, so an update to these details otherwise applies from the next start. Run
+`/venice-refresh-models` after updating to apply it right away (see [Model catalog](#model-catalog)).
+Until then, a level the cached entry lacks (for example `off`) is clamped to the nearest supported
+one.
+
+## Model catalog
+
+`/venice-refresh-models` fetches Venice's catalog now, saves it to `models-store.json`, and reports
+the model count and which models were added, removed, or updated. If the current model is a Venice
+model whose entry changed, the session switches to the refreshed entry right away. Its thinking
+level is kept, except that a configured level the old entry could not offer (for example a default
+of `off`) now takes effect. If the refresh fails, the cached models stay in use and the error is
+shown.
+
+Pi refreshes catalogs in the background only in interactive and RPC mode: print mode (`pi -p`)
+reads the cache, and `pi update --models` does not refresh extension catalogs. The command also
+works headlessly, printing its report to stderr:
+
+```bash
+pi -p /venice-refresh-models
+```
+
+Like `pi update --models`, it fetches even with `--offline` or `PI_OFFLINE` set, since it is an
+explicit request.
 
 ## Features
 
 - Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
-  support tool calling, and cached in `models-store.json`. Venice's E2EE-capable models are included
-  and run in TEE-only mode (see [TEE models](#tee-models)).
+  support tool calling, and cached in `models-store.json`; `/venice-refresh-models` refetches it on
+  demand (see [Model catalog](#model-catalog)). Venice's E2EE-capable models are included and run in
+  TEE-only mode (see [TEE models](#tee-models)).
 - One catalog model is left out because its tool calling fails on every request:
   `e2ee-qwen3-vl-30b-a3b-p` (see [TEE models](#tee-models)).
 - Contradictory catalog limits (max output at or above the context window) are clamped so an
