@@ -539,6 +539,30 @@ describe("key rotation through the real adapter", () => {
 		assert.equal(second.message.stopReason, "stop");
 	});
 
+	it("switches an Authorization header from Pi's authHeader to the fallback key", async () => {
+		respond = (request, res) => (request.key === "key-1" ? insufficientBalance(res) : streamText(res, "ok"));
+		const result = await run(veniceApi(new Keyring()), kimi(), userContext(), options({
+			headers: { Authorization: "Bearer key-1" },
+		}));
+
+		assert.deepEqual(
+			received.map((request) => request.key),
+			["key-1", "key-2"],
+		);
+		assert.equal(result.message.stopReason, "stop");
+	});
+
+	it("sends a chosen key when Pi's authHeader carries the primary", async () => {
+		const keyring = new Keyring();
+		keyring.choose("key-2");
+		await run(veniceApi(keyring), kimi(), userContext(), options({ headers: { Authorization: "Bearer key-1" } }));
+
+		assert.deepEqual(
+			received.map((request) => request.key),
+			["key-2"],
+		);
+	});
+
 	it("sends the same Venice defaults on the retried key", async () => {
 		respond = (request, res) => (request.key === "key-1" ? insufficientBalance(res) : streamText(res, "ok"));
 		await run(veniceApi(new Keyring()), grok(), userContext(), options({ sessionId: "session-1" }));

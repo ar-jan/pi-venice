@@ -53,6 +53,11 @@ next key. The switch is remembered for the process lifetime, so later requests g
 working key. When every key fails, the next request returns to your selected key, or the primary
 when none is selected.
 
+Venice does not need Pi's `authHeader` setting, since the key is already sent as
+`Authorization: Bearer`. If it is set, the header follows the key through failover and `/venice-key`.
+A request whose `Authorization` header (from `headers` in `models.json`) carries any other
+credential is sent as configured and never rotated: switching keys could not change it.
+
 **Choosing the active key.** Run `/venice-key` to pick which key a request starts with, or
 `/venice-key 2` to select by number. The selector lists each key's source (stored credential,
 `VENICE_API_KEY_2`, ...), shows only the last four characters, and marks the current key. The choice

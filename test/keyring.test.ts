@@ -12,6 +12,7 @@ import type {
 	AssistantMessageEventStream,
 	Model,
 	ProviderAuthInteraction,
+	ProviderHeaders,
 	ProviderStreams,
 	SimpleStreamOptions,
 	StreamOptions,
@@ -66,17 +67,20 @@ const outcome = (kind: "done" | "started-error" | "error", message: string): Ass
 	return stream;
 };
 
-/** Fake provider that records the key each attempt used. */
+/** Fake provider that records the key and headers each attempt used. */
 function fakeApi(
 	respond: (apiKey: string | undefined) => AssistantMessageEventStream,
-): ProviderStreams & { calls: (string | undefined)[] } {
+): ProviderStreams & { calls: (string | undefined)[]; headers: (ProviderHeaders | undefined)[] } {
 	const calls: (string | undefined)[] = [];
+	const headers: (ProviderHeaders | undefined)[] = [];
 	const produce = (options: StreamOptions | undefined) => {
 		calls.push(options?.apiKey);
+		headers.push(options?.headers);
 		return respond(options?.apiKey);
 	};
 	return {
 		calls,
+		headers,
 		stream: (_model, _context, options) => produce(options),
 		streamSimple: (_model, _context, options) => produce(options),
 	};
@@ -226,6 +230,64 @@ describe("withKeyRotation", () => {
 
 		assert.deepEqual(api.calls, ["key-1", "key-2"]);
 		assert.equal(result.stopReason, "stop");
+	});
+
+	describe("with an Authorization header", () => {
+		const withHeaders = (apiKey: string, headers: ProviderHeaders): StreamOptions => ({
+			apiKey,
+			env: fallback,
+			headers,
+		});
+		const balanceFailureOnKey1 = (key: string | undefined) =>
+			key === "key-1" ? outcome("error", "402 Payment Required") : outcome("done", "ok");
+
+		it("switches the header Pi's authHeader built from the resolved key", async () => {
+			const api = fakeApi(balanceFailureOnKey1);
+			const rotated = withKeyRotation(api);
+			const result = await drain(call(rotated, withHeaders("key-1", { Authorization: "Bearer key-1", "X-Trace": "t" })));
+
+			assert.deepEqual(api.calls, ["key-1", "key-2"]);
+			assert.deepEqual(api.headers, [
+				{ Authorization: "Bearer key-1", "X-Trace": "t" },
+				{ Authorization: "Bearer key-2", "X-Trace": "t" },
+			]);
+			assert.equal(result.stopReason, "stop");
+		});
+
+		it("sends a chosen key in the header from the first attempt", async () => {
+			const keyring = new Keyring();
+			keyring.choose("key-2");
+			const api = fakeApi(() => outcome("done", "ok"));
+
+			await drain(call(withKeyRotation(api, keyring), withHeaders("key-1", { Authorization: "Bearer key-1" })));
+
+			assert.deepEqual(api.headers, [{ Authorization: "Bearer key-2" }]);
+		});
+
+		it("matches the header name and scheme in any case", async () => {
+			const api = fakeApi(balanceFailureOnKey1);
+
+			await drain(call(withKeyRotation(api), withHeaders("key-1", { authorization: "bearer key-1" })));
+
+			assert.deepEqual(api.headers.at(-1), { authorization: "Bearer key-2" });
+		});
+
+		for (const value of ["Bearer proxy-token", "Basic dXNlcjpwYXNz", null]) {
+			it(`forwards a request authorized by ${JSON.stringify(value)} without rotating`, async () => {
+				const keyring = new Keyring();
+				keyring.choose("key-2");
+				const api = fakeApi(() => outcome("error", "402 Payment Required"));
+				const rotated = withKeyRotation(api, keyring);
+
+				const result = await drain(call(rotated, withHeaders("key-1", { Authorization: value })));
+				await drain(call(rotated, withHeaders("key-1", { Authorization: value })));
+
+				// Switching apiKey would resend the same credential, so neither request is retried.
+				assert.deepEqual(api.calls, ["key-1", "key-1"]);
+				assert.deepEqual(api.headers, [{ Authorization: value }, { Authorization: value }]);
+				assert.equal(result.stopReason, "error");
+			});
+		}
 	});
 });
 
