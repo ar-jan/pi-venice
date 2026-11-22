@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import { toPiModel } from "../extensions/venice/index.ts";
+import { createModels, getSupportedThinkingLevels, InMemoryCredentialStore, type Provider } from "@earendil-works/pi-ai";
+import registerVenice, { toPiModel } from "../extensions/venice/index.ts";
 
 type Capabilities = Record<string, unknown>;
 
@@ -23,6 +23,31 @@ function veniceModel(
 		},
 	};
 }
+
+describe("catalog refresh", () => {
+	it("sends the bearer key to the configured provider endpoint", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "gateway-key" }));
+		const models = createModels({ credentials });
+		registerVenice({
+			on() {},
+			registerCommand() {},
+			registerProvider(provider: Provider) {
+				models.setProvider({ ...provider, baseUrl: "https://gateway.example/venice/v1/" });
+			},
+		} as never);
+		const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [veniceModel()] }));
+
+		const result = await models.refresh({ providers: ["venice"], allowNetwork: true });
+
+		assert.equal(result.errors.size, 0);
+		assert.equal(fetch.mock.callCount(), 1);
+		const [url, options] = fetch.mock.calls[0]!.arguments;
+		assert.equal(String(url), "https://gateway.example/venice/v1/models?type=text");
+		assert.equal(new Headers(options?.headers).get("authorization"), "Bearer gateway-key");
+		assert.ok(models.getModel("venice", "grok-4-20"));
+	});
+});
 
 describe("toPiModel", () => {
 	it("keeps E2EE-capable models and labels them TEE, not E2EE", () => {

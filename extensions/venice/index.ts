@@ -23,6 +23,7 @@ import {
 	createProvider,
 	type Model,
 	type ProviderStreams,
+	type RefreshModelsContext,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 // Pi's extension loader maps only a fixed set of pi-ai specifiers onto the host
@@ -298,10 +299,14 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 	};
 }
 
-async function fetchVeniceModels(apiKey: string | undefined, signal: AbortSignal): Promise<Model<"openai-completions">[]> {
+async function fetchVeniceModels({
+	baseUrl = BASE_URL,
+	credential,
+	signal,
+}: RefreshModelsContext): Promise<Model<"openai-completions">[]> {
 	const headers: Record<string, string> = { accept: "application/json" };
-	if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-	const response = await fetch(`${BASE_URL}/models?type=text`, {
+	if (credential?.type === "api_key" && credential.key) headers.authorization = `Bearer ${credential.key}`;
+	const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/models?type=text`, {
 		headers,
 		signal: AbortSignal.any([signal, AbortSignal.timeout(MODELS_TIMEOUT_MS)]),
 	});
@@ -353,8 +358,7 @@ export default function (pi: ExtensionAPI) {
 			auth: { apiKey: veniceApiKeyAuth(hasStoredCredential) },
 			models: [],
 			fetchModels: async (context) => {
-				const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
-				const models = await fetchVeniceModels(key, context.signal);
+				const models = await fetchVeniceModels(context);
 				catalogFetches++;
 				return models;
 			},
