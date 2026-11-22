@@ -14,20 +14,19 @@
  * used first; `/venice-key` can start from any configured key and remembers that choice.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
 	ApiKeyAuth,
-	ApiKeyCredential,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
-	AuthResult,
 	ProviderEnv,
 	ProviderStreams,
 } from "@earendil-works/pi-ai";
-import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 export const FALLBACK_KEY_PREFIX = "VENICE_API_KEY_";
 const FALLBACK_KEY_RE = /^VENICE_API_KEY_(\d+)$/;
@@ -84,77 +83,52 @@ export function nextFallbackIndex(env: ProviderEnv | undefined): number {
 	return index;
 }
 
-/** The `source` that `envApiKeyAuth` reports when auth came from the stored credential. */
-const STORED_CREDENTIAL_SOURCE = "stored credential";
+const UNVERIFIED_STORE = "Pi could not verify that the active credential store is empty for Venice. Login stopped.";
 
-/**
- * Whether auth that pi resolved through its own credential store came from a stored key.
- * `envApiKeyAuth` reports this source when, and only when, a stored credential has a key.
- * Only a yes/no: the resolved key has `$VAR` and `!command` references expanded, so it must
- * never be written back (see `readStoredVeniceCredential`).
- */
-export function isStoredCredentialAuth(auth: AuthResult | undefined): boolean {
-	return auth?.source === STORED_CREDENTIAL_SOURCE && Boolean(auth.auth.apiKey);
-}
-
-/**
- * The stored credential exactly as written, read with pi's own auth.json reader (same path, BOM
- * tolerant). Raw on purpose: pi's credential store resolves `!command` and `$VAR` keys on read,
- * and login writes back what it is given, so a resolved key would replace the reference with
- * the plaintext secret.
- */
-export function readStoredVeniceCredential(): ApiKeyCredential | undefined {
-	const credential = readStoredCredential("venice");
-	return credential?.type === "api_key" && credential.key ? credential : undefined;
-}
-
-/** Whether pi's credential store holds a Venice key, or undefined when that cannot be asked. */
-export type StoredCredentialCheck = () => Promise<boolean | undefined>;
-
-/**
- * Venice API-key auth whose login adds keys instead of replacing them.
- *
- * The first `/login venice` stores the primary key. Later runs append the entered key to the stored
- * credential's `env` as the next `VENICE_API_KEY_N`, which the request wrapper uses as a fallback.
- * When the primary comes from `VENICE_API_KEY` instead, a stored key would silently override that
- * environment variable, so login explains the environment variable to set instead.
- */
-export function veniceApiKeyAuth(hasStoredCredential: StoredCredentialCheck = async () => undefined): ApiKeyAuth {
+/** Pi persists the login result as a replacement. Only the host's store sees the raw current credential. */
+export function veniceApiKeyAuth(getRegistry: () => ModelRegistry | undefined): ApiKeyAuth {
 	const base = envApiKeyAuth("Venice API key", ["VENICE_API_KEY"]);
+	const loginCheck = new AsyncLocalStorage<{ empty: boolean }>();
+
+	async function checkFirstLogin(registry: ModelRegistry): Promise<void> {
+		const check = { empty: false };
+		const { source } = registry.getProviderAuthStatus("venice");
+		// A runtime override can hide a stored entry. A negative status is only a snapshot.
+		if (source !== "stored" && source !== "runtime") {
+			await loginCheck.run(check, () => registry.getProviderAuth("venice"));
+		}
+		if (!check.empty) {
+			throw new Error(
+				"Login can only set the first Venice key. To add a fallback, set the next unused VENICE_API_KEY_N (starting at 2) in the environment or in the active Venice credential's env.",
+			);
+		}
+		if (process.env.VENICE_API_KEY) {
+			const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(undefined)}`;
+			throw new Error(
+				`VENICE_API_KEY is set, so Venice is configured from the environment and a stored key would override it. Add a fallback with: export ${name}=<key>`,
+			);
+		}
+	}
+
 	return {
 		...base,
+		resolve(input) {
+			// An entry with an unresolved $VAR or !command still has a credential object.
+			// Observe only its presence, scoped to this login's own registry request.
+			const check = loginCheck.getStore();
+			if (check) check.empty = input.credential === undefined;
+			return base.resolve(input);
+		},
 		login: async (interaction) => {
-			const stored = readStoredVeniceCredential();
-			// "Nothing stored" returns a fresh credential, and pi's login replaces the stored one with
-			// it, dropping the primary and every fallback. Only take that path when pi agrees.
-			if (!stored && (await hasStoredCredential())) {
-				throw new Error(
-					"A Venice key is stored, but it could not be read from auth.json, so login will not replace it. Edit auth.json directly, or run /logout venice first.",
-				);
-			}
+			const registry = getRegistry();
+			if (!registry) throw new Error(UNVERIFIED_STORE);
+			await checkFirstLogin(registry);
+			const credential = await base.login!(interaction);
+			// Another process can add a credential while the prompt is open.
+			await checkFirstLogin(registry);
 			interaction.signal.throwIfAborted();
-			if (stored) {
-				const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(stored.env)}`;
-				const key = await interaction.prompt({
-					type: "secret",
-					message: `Enter the fallback Venice API key to store as ${name}`,
-				});
-				interaction.signal.throwIfAborted();
-				interaction.notify({
-					type: "info",
-					message: `Stored as ${name} in auth.json. It is used after the stored key runs out; run /login venice again to add another key.`,
-				});
-				return { ...stored, env: { ...stored.env, [name]: key } };
-			}
-			if (process.env.VENICE_API_KEY) {
-				const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(undefined)}`;
-				throw new Error(
-					`VENICE_API_KEY is set, so Venice is configured from the environment and a stored key would override it. Add a fallback with: export ${name}=<key>`,
-				);
-			}
-			const key = await interaction.prompt({ type: "secret", message: "Enter Venice API key" });
-			interaction.signal.throwIfAborted();
-			return { type: "api_key", key };
+			if (registry !== getRegistry()) throw new Error(UNVERIFIED_STORE);
+			return credential;
 		},
 	};
 }

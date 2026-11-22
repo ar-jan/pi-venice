@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, it } from "node:test";
-import { createAssistantMessageEventStream, createModels, createProvider } from "@earendil-works/pi-ai";
-// AuthStorage is not exported from the package root; the test uses the store pi itself runs on.
-import { AuthStorage } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js";
+import { afterEach, beforeEach, describe, it, type TestContext } from "node:test";
+import { createAssistantMessageEventStream, InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import registerVenice from "../extensions/venice/index.ts";
 import type {
 	ApiKeyCredential,
 	AssistantMessage,
@@ -19,7 +19,6 @@ import type {
 import {
 	candidateKeys,
 	describeKeys,
-	isStoredCredentialAuth,
 	Keyring,
 	keyFingerprint,
 	loadPreferredKeyHash,
@@ -292,38 +291,52 @@ describe("preferred key persistence", () => {
 	});
 });
 
-describe("veniceApiKeyAuth login", () => {
+describe("Venice login through Pi's credential store", () => {
 	const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const savedPrimary = process.env.VENICE_API_KEY;
 	const tempDirs: string[] = [];
+	const a = { type: "api_key", key: "a-1", env: { VENICE_API_KEY_2: "a-2" } } as const;
+	const b = { type: "api_key", key: "b-1", env: { VENICE_API_KEY_2: "b-2" } } as const;
+	let defaultDir: string;
+	let defaultAuthPath: string;
 
-	function useAuthFile(content?: unknown, raw = false): string {
+	function profile(venice?: ApiKeyCredential): string {
 		const dir = mkdtempSync(join(tmpdir(), "pi-venice-auth-"));
 		tempDirs.push(dir);
-		process.env.PI_CODING_AGENT_DIR = dir;
-		const path = join(dir, "auth.json");
-		if (content !== undefined) writeFileSync(path, raw ? String(content) : JSON.stringify(content));
-		return path;
+		writeFileSync(join(dir, "auth.json"), JSON.stringify({ venice }, null, 2));
+		return dir;
 	}
 
-	function interaction(answers: string[]): ProviderAuthInteraction & { prompts: string[]; notices: string[] } {
-		const prompts: string[] = [];
-		const notices: string[] = [];
+	async function veniceRuntime(t: TestContext, agentDir?: string, modelRuntime?: ModelRuntime): Promise<ModelRuntime> {
+		const cwd = agentDir ?? defaultDir;
+		const resourceLoader = new DefaultResourceLoader({ cwd, agentDir: cwd, extensionFactories: [registerVenice] });
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			modelRuntime,
+			resourceLoader,
+			sessionManager: SessionManager.inMemory(cwd),
+		});
+		t.after(() => session.dispose());
+		await session.bindExtensions({});
+		return session.modelRuntime;
+	}
+
+	function interaction(answer?: string): ProviderAuthInteraction {
 		return {
 			signal: new AbortController().signal,
-			prompts,
-			notices,
-			prompt: async (prompt) => {
-				prompts.push(prompt.message);
-				const answer = answers.shift();
-				if (answer === undefined) throw new Error("No answer prepared for prompt");
-				return answer;
-			},
-			notify: (event) => {
-				if (event.type === "info") notices.push(event.message);
-			},
+			prompt: async () => answer ?? assert.fail("Unexpected login prompt"),
+			notify() {},
 		};
 	}
+
+	beforeEach(() => {
+		defaultDir = profile(a);
+		defaultAuthPath = join(defaultDir, "auth.json");
+		process.env.PI_CODING_AGENT_DIR = defaultDir;
+		delete process.env.VENICE_API_KEY;
+	});
 
 	afterEach(() => {
 		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -333,105 +346,108 @@ describe("veniceApiKeyAuth login", () => {
 		else process.env.VENICE_API_KEY = savedPrimary;
 	});
 
-	it("stores the primary key on the first login", async () => {
-		useAuthFile();
-		delete process.env.VENICE_API_KEY;
-		const flow = interaction(["key-1"]);
-		const credential = await veniceApiKeyAuth(async () => false).login!(flow);
+	it("protects both profiles when the alternate profile already has a primary and fallback", async (t) => {
+		const alternate = profile(b);
+		const alternatePath = join(alternate, "auth.json");
+		const beforeA = readFileSync(defaultAuthPath);
+		const beforeB = readFileSync(alternatePath);
+		const runtime = await veniceRuntime(t, alternate);
 
-		assert.deepEqual(credential, { type: "api_key", key: "key-1" });
-		assert.deepEqual(flow.prompts, ["Enter Venice API key"]);
+		await assert.rejects(runtime.login("venice", "api_key", interaction()), /add a fallback/);
+
+		assert.deepEqual(readFileSync(alternatePath), beforeB);
+		assert.deepEqual(readFileSync(defaultAuthPath), beforeA);
 	});
 
-	it("stores the second login as VENICE_API_KEY_2 and keeps the primary", async () => {
-		useAuthFile({ venice: { type: "api_key", key: "key-1", env: { EXISTING: "1" } } });
-		delete process.env.VENICE_API_KEY;
-		const flow = interaction(["key-2"]);
-		const credential = await veniceApiKeyAuth().login!(flow);
+	it("saves only the entered primary in an empty alternate profile", async (t) => {
+		const alternate = profile();
+		const beforeA = readFileSync(defaultAuthPath);
+		const runtime = await veniceRuntime(t, alternate);
 
-		assert.deepEqual(credential, {
-			type: "api_key",
-			key: "key-1",
-			env: { EXISTING: "1", VENICE_API_KEY_2: "key-2" },
+		await runtime.login("venice", "api_key", interaction("new-key"));
+
+		assert.deepEqual(JSON.parse(readFileSync(join(alternate, "auth.json"), "utf8")), {
+			venice: { type: "api_key", key: "new-key" },
 		});
-		assert.match(flow.notices[0] ?? "", /VENICE_API_KEY_2/);
+		assert.deepEqual(readFileSync(defaultAuthPath), beforeA);
 	});
 
-	it("appends the next free numbered key", async () => {
-		useAuthFile({ venice: { type: "api_key", key: "key-1", env: { VENICE_API_KEY_2: "key-2" } } });
-		delete process.env.VENICE_API_KEY;
-		const flow = interaction(["key-3"]);
-		const credential = (await veniceApiKeyAuth().login!(flow)) as ApiKeyCredential;
+	it("protects an alternate profile even when its resolved key and fallbacks match the default", async (t) => {
+		const alternate = profile({ ...a, key: "!echo a-1" });
+		const alternatePath = join(alternate, "auth.json");
+		const beforeB = readFileSync(alternatePath);
+		const runtime = await veniceRuntime(t, alternate);
+		assert.equal((await runtime.getAuth("venice"))?.auth.apiKey, a.key);
 
-		assert.deepEqual(credential.env, { VENICE_API_KEY_2: "key-2", VENICE_API_KEY_3: "key-3" });
+		await assert.rejects(runtime.login("venice", "api_key", interaction()), /add a fallback/);
+		assert.deepEqual(readFileSync(alternatePath), beforeB);
 	});
 
-	it("tells an environment-configured user which variable to export", async () => {
-		useAuthFile();
-		process.env.VENICE_API_KEY = "key-1";
-		const flow = interaction([]);
+	for (const key of ["$PV_TEST_PRIMARY", "!echo dummy-primary"]) {
+		it(`preserves a default profile with a ${key[0]} reference and numbered fallbacks`, async (t) => {
+			const venice = { ...a, key, env: { ...a.env, PV_TEST_PRIMARY: "dummy-primary", VENICE_API_KEY_4: "a-4" } };
+			const contents = `\uFEFF${JSON.stringify({ venice })}\n`;
+			writeFileSync(defaultAuthPath, contents);
+			const runtime = await veniceRuntime(t);
 
-		await assert.rejects(veniceApiKeyAuth().login!(flow), /export VENICE_API_KEY_2=<key>/);
-		assert.deepEqual(flow.prompts, []);
+			await assert.rejects(runtime.login("venice", "api_key", interaction()), /add a fallback/);
+			assert.equal(readFileSync(defaultAuthPath, "utf8"), contents);
+		});
+	}
+
+	it("uses the injected store even when its agentDir points to a populated profile", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		const beforeA = readFileSync(defaultAuthPath);
+		const runtime = await veniceRuntime(t, defaultDir, await ModelRuntime.create({ credentials, modelsPath: null }));
+
+		await runtime.login("venice", "api_key", interaction("injected-primary"));
+		assert.deepEqual(await credentials.read("venice"), { type: "api_key", key: "injected-primary" });
+
+		await credentials.modify("venice", async () => b);
+		await assert.rejects(runtime.login("venice", "api_key", interaction()), /add a fallback/);
+		assert.deepEqual(await credentials.read("venice"), b);
+		assert.deepEqual(readFileSync(defaultAuthPath), beforeA);
 	});
 
-	it("keeps a $VAR or !command primary key as written", async () => {
-		useAuthFile({ venice: { type: "api_key", key: "!pass show venice" } });
-		delete process.env.VENICE_API_KEY;
-		const credential = (await veniceApiKeyAuth(async () => true).login!(interaction(["key-2"]))) as ApiKeyCredential;
-
-		assert.equal(credential.key, "!pass show venice");
+	it("checks for an entry added while the prompt is open, even if its primary cannot resolve", async (t) => {
+		const alternate = profile();
+		const alternatePath = join(alternate, "auth.json");
+		const runtime = await veniceRuntime(t, alternate);
+		const contents = JSON.stringify({ venice: { type: "api_key", key: "$PV_TEST_UNSET_KEY", env: b.env } });
+		await assert.rejects(runtime.login("venice", "api_key", {
+			...interaction(),
+			prompt: async () => {
+				writeFileSync(alternatePath, contents);
+				return "new-key";
+			},
+		}), /add a fallback/);
+		assert.equal(readFileSync(alternatePath, "utf8"), contents);
 	});
 
-	it("reads an auth.json saved with a byte order mark", async () => {
-		useAuthFile(`\uFEFF${JSON.stringify({ venice: { type: "api_key", key: "key-1" } })}`, true);
-		delete process.env.VENICE_API_KEY;
-		const credential = (await veniceApiKeyAuth(async () => true).login!(interaction(["key-2"]))) as ApiKeyCredential;
-
-		assert.deepEqual(credential, { type: "api_key", key: "key-1", env: { VENICE_API_KEY_2: "key-2" } });
+	it("stops when the active store fails during the login check", async (t) => {
+		const alternate = profile();
+		const alternatePath = join(alternate, "auth.json");
+		const runtime = await veniceRuntime(t, alternate);
+		await assert.rejects(runtime.login("venice", "api_key", {
+			...interaction(),
+			prompt: async () => {
+				writeFileSync(alternatePath, "{ invalid");
+				return "new-key";
+			},
+		}), /Credential store read failed/);
+		assert.equal(readFileSync(alternatePath, "utf8"), "{ invalid");
 	});
 
-	it("refuses to replace stored keys it cannot read", async () => {
-		useAuthFile("{ not json", true);
-		delete process.env.VENICE_API_KEY;
-		const flow = interaction(["key-9"]);
-
-		await assert.rejects(veniceApiKeyAuth(async () => true).login!(flow), /will not replace it/);
-		assert.deepEqual(flow.prompts, []);
+	it("stops when the session registry is unavailable", async () => {
+		await assert.rejects(veniceApiKeyAuth(() => undefined).login!(interaction()), /could not verify/);
 	});
 
-	it("keeps every key through pi's own login and auth.json store", async () => {
-		const path = useAuthFile({ venice: { type: "api_key", key: "$PV_TEST_PRIMARY" } });
-		delete process.env.VENICE_API_KEY;
-		process.env.PV_TEST_PRIMARY = "sk-resolved";
-		try {
-			const credentials = AuthStorage.create(path);
-			const models = createModels({ credentials });
-			const hasStored = async () => isStoredCredentialAuth(await models.getAuth("venice"));
-			models.setProvider(
-				createProvider({ id: "venice", auth: { apiKey: veniceApiKeyAuth(hasStored) }, models: [], api: fakeApi(() => outcome("done", "ok")) }),
-			);
-
-			await models.login("venice", "api_key", interaction(["key-2"]));
-			await models.login("venice", "api_key", interaction(["key-3"]));
-
-			assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).venice, {
-				type: "api_key",
-				key: "$PV_TEST_PRIMARY",
-				env: { VENICE_API_KEY_2: "key-2", VENICE_API_KEY_3: "key-3" },
-			});
-		} finally {
-			delete process.env.PV_TEST_PRIMARY;
-		}
-	});
-});
-
-describe("isStoredCredentialAuth", () => {
-	it("recognizes auth from a stored key and ignores environment-sourced auth", () => {
-		assert.equal(isStoredCredentialAuth({ auth: { apiKey: "key-1" }, source: "stored credential" }), true);
-		assert.equal(isStoredCredentialAuth({ auth: { apiKey: "key-1" }, source: "VENICE_API_KEY" }), false);
-		assert.equal(isStoredCredentialAuth({ auth: {}, source: "stored credential" }), false);
-		assert.equal(isStoredCredentialAuth(undefined), false);
+	it("tells an environment-configured user which variable to export", async (t) => {
+		const alternate = profile();
+		process.env.VENICE_API_KEY = "env-primary";
+		const runtime = await veniceRuntime(t, alternate);
+		await assert.rejects(runtime.login("venice", "api_key", interaction()), /export VENICE_API_KEY_2=<key>/);
+		assert.deepEqual(JSON.parse(readFileSync(join(alternate, "auth.json"), "utf8")), {});
 	});
 });
 

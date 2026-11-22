@@ -10,18 +10,19 @@ pi install git:github.com/ar-jan/pi-venice
 
 ## Auth
 
-`/login venice` (stored in `auth.json`), or via the `VENICE_API_KEY` environment variable.
+Run `/login venice` to save a primary key in Pi's active credential store, or set `VENICE_API_KEY`.
 
 ## Key rotation
 
 A second (or third) key can take over when the current key runs out of credits.
 
-**Stored credential (recommended).** Run `/login venice` once to store the primary key. Running it
-again prompts for another key and stores it in `auth.json` under the credential's `env` as
-`VENICE_API_KEY_2`; further runs use `VENICE_API_KEY_3`, and so on. The stored primary stays first,
-and a primary stored as a `$VAR` or `!command` reference is kept as written. To replace the primary
-key, run `/logout venice` and log in again (this also removes the stored fallback keys). If
-`auth.json` holds a Venice key that cannot be read, login stops instead of replacing it.
+**Stored credential.** Once the active store has a Venice credential, repeat login stops. Pi's
+login hook receives no raw credential to append to. To add a fallback, use the first unused
+`VENICE_API_KEY_N` starting at 2 across the environment and the active Venice credential's `env`.
+For file-backed profiles, edit that profile's `auth.json`. SDK hosts with an injected store can
+edit the Venice entry in that store. Keep the primary key (including any `$VAR` or `!command`
+reference) and existing fallback numbers as written. To replace the whole credential, run
+`/logout venice` and log in again. Logging out also removes its stored fallbacks.
 
 **Environment.** If the primary key comes from `VENICE_API_KEY`, `/login venice` explains which
 variable to export instead, because a stored key would override the environment. Add fallbacks with
@@ -32,8 +33,8 @@ export VENICE_API_KEY=key-1
 export VENICE_API_KEY_2=key-2
 ```
 
-Keys can also be edited directly in `auth.json` (provider-scoped values take precedence over the
-process environment):
+In the active profile's `auth.json`, provider-scoped values take precedence over the process
+environment for the same fallback number.
 
 ```json
 {
