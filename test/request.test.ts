@@ -230,7 +230,7 @@ describe("Claude cache breakpoints", () => {
 			content: [{ type: "text", text: "You are pi.", cache_control: cache }],
 		});
 		assert.deepEqual(messages[5], { role: "tool", tool_call_id: "c2", content: "second", cache_control: cache });
-		// Only the last turn gets a breakpoint; Venice places its own on the turn before.
+		// Only the last turn gets a breakpoint; earlier turns are covered by it and by Venice's own.
 		assert.deepEqual(messages.slice(1, 5), snapshot.slice(1, 5));
 		assert.deepEqual(input, snapshot);
 	});

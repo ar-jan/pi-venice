@@ -331,11 +331,12 @@ describe("request body through the real adapter", () => {
 		});
 
 		const [instruction, , , toolResult] = messagesSent();
-		// The instruction message: on its text part (Venice adds none of its own for `developer`).
+		// The instruction message: on its text part (Venice used to add none for `developer`).
 		assert.equal(instruction!.role, "developer");
 		const parts = instruction!.content as Record<string, unknown>[];
 		assert.deepEqual(parts.at(-1)!.cache_control, { type: "ephemeral" });
-		// The last turn is a tool result: on the message itself, the only form Venice reads there.
+		// The last turn is a tool result: on the message itself, the only form Venice read there before
+		// it placed its own.
 		assert.equal(toolResult!.role, "tool");
 		assert.deepEqual(toolResult!.cache_control, { type: "ephemeral" });
 		assert.equal(typeof toolResult!.content, "string");

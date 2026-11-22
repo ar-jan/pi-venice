@@ -94,8 +94,9 @@ supported one.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
   prefix (omitted when prompt caching is set to `none`, or when a `modelOverrides` entry sets
   `compat.promptCacheKeyMode` to `"disabled"`).
-- Claude requests carry their own cache breakpoints, so each tool result is written to the cache once
-  instead of being billed as uncached input first (see [Claude prompt caching](#claude-prompt-caching)).
+- Claude requests carry their own cache breakpoints as a safeguard, so each tool result stays written
+  to the cache once even if Venice's own placement regresses (see
+  [Claude prompt caching](#claude-prompt-caching)).
 - Venice reports cache writes as `cache_creation_input_tokens`, which Pi's OpenAI-completions adapter
   does not read. The streamed usage is corrected before Pi sees it: written tokens move from `input`
   to `cacheWrite` and the cost is recomputed, so cache reads and Claude's cache-write premium are
@@ -173,18 +174,22 @@ when it is aborted, keeps the catalog estimate.
 
 ## Claude prompt caching
 
-Claude only caches up to explicit breakpoints. Venice adds its own on a `system` message and on the
-second-to-last user turn (tool results count as user turns), which leaves the newest turn out: every
-tool result is billed as uncached input on the request that sends it, then written to the cache on
-the next request. Venice also adds none for a `developer` message, which pi uses for reasoning
-models, so on its own the first request of a session caches nothing.
+Claude only caches up to cache breakpoints, which Venice places itself. Since November 2026 its
+placement covers the whole prompt, including a `developer` message and the newest tool result, so
+each turn is written to the cache once and read back by the next request.
 
-For `claude-*` models the extension therefore adds two breakpoints of its own: on the system prompt
-and on the last turn, in the form Venice honors for each role (on the message itself for a tool
-result, on the last text part for a user message; Venice ignores breakpoints on images). Each turn is
-then written once and read back by the next request. In an 8-turn tool chain measured in pi this cut
-the cost by 31% on Claude Haiku 5.5 and 36% on Claude Opus 5.5. The final turn of a conversation is
-written to the cache at Claude's write premium even if no request reads it back.
+Before that, Venice's breakpoints stopped at the second-to-last user turn (tool results count as
+user turns): every tool result was billed as uncached input on the request that sent it, then
+written to the cache on the next request. A `developer` message, which pi uses for reasoning models,
+got none, so the first request of a session cached nothing.
+
+For `claude-*` models the extension still adds two breakpoints of its own: on the system prompt and
+on the last turn, in the form Venice honored for each role (on the message itself for a tool result,
+on the last text part for a user message; Venice ignores breakpoints on images). Against Venice's
+old placement this cut the cost of an 8-turn tool chain in pi by 31% on Claude Haiku 5.5 and 36% on
+Claude Opus 5.5. Against the current placement they change nothing Venice bills; they are kept so
+caching stays intact if Venice's placement regresses. The final turn of a conversation is written to
+the cache at Claude's write premium even if no request reads it back.
 
 No breakpoints are added when prompt caching is set to `none`. Other models cache automatically and
 are unaffected.

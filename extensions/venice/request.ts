@@ -22,11 +22,15 @@
  * prices: web search adds about $0.01 a request, so a search turn can cost 20 times its tokens. The
  * per-category amounts stay catalog estimates (see applyVeniceReportedCost).
  *
- * Claude needs explicit cache breakpoints. Venice adds its own on a `system` message and on the
- * second-to-last user turn (tool results count as user turns), so the newest exchange is billed as
- * uncached input and then written to the cache on the next request: every tool result is paid
- * twice. Venice also adds no breakpoint for a `developer` message. Requests to Claude therefore get
- * breakpoints of their own on the instruction message and the last turn (see withCacheBreakpoints).
+ * Claude caches only up to cache breakpoints, which Venice places itself. Its placement now covers
+ * the whole prompt, including a `developer` message and the newest tool result, so each turn is
+ * written to the cache once and read back by the next request (measured against the live API on
+ * 2026-11-20). On 2026-11-02 it did not: Venice's breakpoints stopped at the second-to-last user
+ * turn (tool results count as user turns), so every tool result was billed as uncached input and
+ * then written to the cache on the next request, and a `developer` message got none. Requests to
+ * Claude still carry breakpoints of their own on the instruction message and the last turn (see
+ * withCacheBreakpoints). They no longer change what Venice bills, and keep caching intact if
+ * Venice's placement regresses.
  *
  * Venice rejects a message string that contains a NUL byte (U+0000) with HTTP 400, "String must
  * not contain null bytes"; every other control character is accepted. A NUL in one message therefore
@@ -269,7 +273,7 @@ function promptCacheKey(context: VeniceRequestContext): string | undefined {
 /** A fresh object per breakpoint, so a later payload hook cannot change them all at once. */
 const ephemeralCache = () => ({ type: "ephemeral" });
 
-/** Claude caches only up to explicit breakpoints; every other Venice backend caches on its own. */
+/** Claude caches only up to breakpoints (now placed by Venice too); other backends need none. */
 function usesExplicitCacheBreakpoints(model: Model<Api>): boolean {
 	return model.id.startsWith("claude-");
 }
@@ -298,18 +302,21 @@ function withTextBreakpoint(message: Record<string, unknown>): Record<string, un
 }
 
 /**
- * Place Claude cache breakpoints where Venice honors them (measured against the live API):
- * - The first `system`/`developer` message, on its last text part. Venice adds no breakpoint of its
- *   own for `developer`, so without this the first request of a session caches nothing.
+ * Place Claude cache breakpoints on the instruction message and the last turn. Venice now places
+ * equivalent ones itself, so these are a safeguard against a regression rather than a saving: the
+ * same tool loop is billed the same with and without them (see the module comment).
+ * - The first `system`/`developer` message, on its last text part. Venice used to add none for
+ *   `developer`, so without this the first request of a session cached nothing.
  * - The last turn, so the whole prompt is written now and read back by the next request instead of
- *   being billed as uncached input first. Venice reads a breakpoint on a `tool` message only from the
- *   message itself and on a `user` message only from a text part, so each role gets its own form.
- *   Venice ignores breakpoints on images, so a turn ending in an image is cached up to its
- *   last text part. Messages of other roles and user messages without text are skipped, so the
- *   breakpoint lands on the latest turn that can carry one.
+ *   being billed as uncached input first. Each role gets the form Venice honored before it placed
+ *   these itself: on a `tool` message the message itself (a breakpoint in its content was ignored),
+ *   on a `user` message a text part. Venice ignores breakpoints on images, so a turn ending in an
+ *   image is cached up to its last text part. Messages of other roles and user messages without
+ *   text are skipped, so the breakpoint lands on the latest turn that can carry one.
  *
- * Together with Venice's own breakpoint on the second-to-last user turn this stays within Claude's
- * limit of four. Messages are copied on write; the input is not mutated.
+ * Claude allows four breakpoints, but Venice reconciles client breakpoints with its own: a request
+ * with five client breakpoints was accepted and fully cached (2026-11-22), so these two cannot push
+ * a request over the limit. Messages are copied on write; the input is not mutated.
  */
 function withCacheBreakpoints(body: Record<string, unknown>): Record<string, unknown> {
 	if (!Array.isArray(body.messages)) return body;
