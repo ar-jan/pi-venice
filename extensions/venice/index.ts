@@ -44,7 +44,7 @@ import {
 	veniceApiKeyAuth,
 	withKeyRotation,
 } from "./keyring.ts";
-import { registerRefreshCommand } from "./refresh.ts";
+import { registerProviderWithRefreshCommand } from "./refresh.ts";
 import { VENICE_MAX_IMAGES_PER_REQUEST, withVeniceRequestDefaults } from "./request.ts";
 
 const PROVIDER_ID = "venice";
@@ -348,25 +348,18 @@ export default function (pi: ExtensionAPI) {
 	const hasStoredCredential = async () =>
 		registry ? isStoredCredentialAuth(await registry.getProviderAuth(PROVIDER_ID)) : undefined;
 
-	// Successful catalog requests, so /venice-refresh-models can tell whether its refresh fetched.
-	let catalogFetches = 0;
-	pi.registerProvider(
+	registerProviderWithRefreshCommand(
+		pi,
 		createProvider({
 			id: PROVIDER_ID,
 			name: "Venice AI",
 			baseUrl: BASE_URL,
 			auth: { apiKey: veniceApiKeyAuth(hasStoredCredential) },
 			models: [],
-			fetchModels: async (context) => {
-				const models = await fetchVeniceModels(context);
-				catalogFetches++;
-				return models;
-			},
+			fetchModels: fetchVeniceModels,
 			api: veniceApi(keyring),
 		}),
 	);
-
-	registerRefreshCommand(pi, PROVIDER_ID, () => catalogFetches);
 
 	pi.registerCommand("venice-key", {
 		description: "Select the active Venice API key",

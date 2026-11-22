@@ -10,7 +10,14 @@
  * (`pi -p /venice-refresh-models`) also works as a headless refresh.
  */
 
-import { type Api, clampThinkingLevel, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+	type Api,
+	clampThinkingLevel,
+	getSupportedThinkingLevels,
+	type Model,
+	type Provider,
+} from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 /** Covers key resolution plus the catalog request's own 15 s timeout. */
@@ -109,11 +116,27 @@ async function applyToCurrentModel(
 	return lines;
 }
 
-/**
- * @param catalogFetches How many catalog requests have succeeded so far. A refresh that another
- *   refresh supersedes (pi starts one whenever `/model` opens) returns without error or fetch.
- */
-export function registerRefreshCommand(pi: ExtensionAPI, providerId: string, catalogFetches: () => number): void {
+/** Register the dynamic provider and report a command's success once Pi accepts its fetched catalog. */
+export function registerProviderWithRefreshCommand(pi: ExtensionAPI, provider: Provider): void {
+	const providerId = provider.id;
+	const activeCommand = new AsyncLocalStorage<{ published: boolean }>();
+	pi.registerProvider({
+		...provider,
+		refreshModels(context) {
+			const command = activeCommand.getStore();
+			if (!command || !context.allowNetwork) return provider.refreshModels!(context);
+			return provider.refreshModels!({
+				...context,
+				publish: async (publication) => {
+					const accepted = await context.publish(publication);
+					// Pi also publishes the cached catalog during refresh. Only the fetched catalog has a store entry.
+					if (accepted && publication.persist) command.published = true;
+					return accepted;
+				},
+			});
+		},
+	});
+
 	pi.registerCommand("venice-refresh-models", {
 		description: "Fetch the Venice model catalog now and apply it to the current model",
 		handler: async (_args, ctx) => {
@@ -125,15 +148,17 @@ export function registerRefreshCommand(pi: ExtensionAPI, providerId: string, cat
 			}
 
 			const before = ctx.modelRegistry.getModelsOfType("chat", providerId);
-			const fetchesBefore = catalogFetches();
+			const command = { published: false };
 			let result: Awaited<ReturnType<ExtensionCommandContext["modelRegistry"]["refresh"]>>;
 			try {
-				result = await ctx.modelRegistry.refresh({
-					providers: [providerId],
-					allowNetwork: true,
-					force: true,
-					signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
-				});
+				result = await activeCommand.run(command, () =>
+					ctx.modelRegistry.refresh({
+						providers: [providerId],
+						allowNetwork: true,
+						force: true,
+						signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+					}),
+				);
 			} catch (error) {
 				result = { aborted: false, errors: new Map([[providerId, error as Error]]) };
 			}
@@ -148,7 +173,7 @@ export function registerRefreshCommand(pi: ExtensionAPI, providerId: string, cat
 				report(ctx, "The Venice catalog refresh timed out. Keeping the cached models.", "error");
 				return;
 			}
-			if (catalogFetches() === fetchesBefore) {
+			if (!command.published) {
 				report(ctx, "Another model refresh interrupted this one. Run /venice-refresh-models again.", "warning");
 				return;
 			}

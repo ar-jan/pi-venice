@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { describe, it } from "node:test";
-import { type Api, clampThinkingLevel, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { toPiModel } from "../extensions/venice/index.ts";
-import { describeCatalogChange, registerRefreshCommand } from "../extensions/venice/refresh.ts";
+import {
+	type Api,
+	clampThinkingLevel,
+	createModels,
+	InMemoryCredentialStore,
+	InMemoryModelsStore,
+	type Model,
+	type ModelsRefreshOptions,
+	type ModelThinkingLevel,
+	type Provider,
+} from "@earendil-works/pi-ai";
+import registerVenice, { toPiModel } from "../extensions/venice/index.ts";
+import { describeCatalogChange, registerProviderWithRefreshCommand } from "../extensions/venice/refresh.ts";
 
 function model(id: string, options: { efforts?: string[]; input?: number } = {}): Model<Api> {
 	const result = toPiModel({
@@ -49,11 +60,11 @@ function harness(options: {
 	configuredLevel?: ModelThinkingLevel;
 	auth?: unknown;
 	refresh?: () => Promise<{ aborted: boolean; errors: Map<string, Error> }>;
-	fetches?: boolean;
+	publishes?: boolean;
 	hasUI?: boolean;
 }): Harness {
 	let catalog = options.cached;
-	let fetches = 0;
+	let provider: Provider;
 	let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
 	const notifications: Notification[] = [];
 	const refreshCalls: unknown[] = [];
@@ -62,6 +73,9 @@ function harness(options: {
 	const configured = options.configuredLevel ?? session.level;
 
 	const pi = {
+		registerProvider: (registered: Provider) => {
+			provider = registered;
+		},
 		registerCommand: (name: string, command: { handler: typeof handler }) => {
 			assert.equal(name, "venice-refresh-models");
 			handler = command.handler;
@@ -77,7 +91,18 @@ function harness(options: {
 			return true;
 		},
 	};
-	registerRefreshCommand(pi as never, "venice", () => fetches);
+	registerProviderWithRefreshCommand(pi as never, {
+		id: "venice",
+		async refreshModels(context) {
+			const models = options.fetched ?? catalog;
+			await context.publish({
+				persist: { models, checkedAt: 1 },
+				update: () => {
+					catalog = models;
+				},
+			});
+		},
+	} as Provider);
 
 	const ctx = {
 		hasUI: options.hasUI ?? true,
@@ -92,13 +117,18 @@ function harness(options: {
 				return catalog;
 			},
 			find: (provider: string, id: string) => catalog.find((entry) => entry.provider === provider && entry.id === id),
-			refresh: async (refreshOptions: unknown) => {
+			refresh: async (refreshOptions: ModelsRefreshOptions) => {
 				refreshCalls.push(refreshOptions);
 				if (options.refresh) return options.refresh();
-				if (options.fetches !== false) {
-					catalog = options.fetched ?? catalog;
-					fetches++;
-				}
+				await provider.refreshModels!({
+					allowNetwork: refreshOptions.allowNetwork!,
+					signal: refreshOptions.signal!,
+					publish: async (publication) => {
+						if (options.publishes === false) return false;
+						publication.update?.();
+						return true;
+					},
+				});
 				return { aborted: false, errors: new Map() };
 			},
 		},
@@ -143,6 +173,62 @@ describe("describeCatalogChange", () => {
 });
 
 describe("/venice-refresh-models", () => {
+	it("warns when Pi discards the catalog during persistence, even if a later command publishes", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const modelsStore = new InMemoryModelsStore();
+		await modelsStore.write("venice", { models: [model("old")], checkedAt: 1 });
+		const models = createModels({ credentials, modelsStore });
+		let runCommand!: (args: string, ctx: unknown) => Promise<void>;
+		registerVenice({
+			on() {},
+			registerProvider: (provider: Provider) => models.setProvider(provider),
+			registerCommand(name: string, command: { handler: typeof runCommand }) {
+				if (name === "venice-refresh-models") runCommand = command.handler;
+			},
+		} as never);
+		await models.refresh({ providers: ["venice"], allowNetwork: false });
+		t.mock.method(globalThis, "fetch", async () => Response.json({
+			data: [{ id: "new", model_spec: { capabilities: { supportsFunctionCalling: true } } }],
+		}));
+		const writeStarted = new Promise<void>((resolve) => {
+			const waitForAbort: typeof modelsStore.write = async (_id, _entry, options) => {
+				resolve();
+				await once(options!.signal!, "abort");
+			};
+			t.mock.method(modelsStore, "write", waitForAbort, { times: 1 });
+		});
+
+		const notifications: Notification[] = [];
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+			modelRegistry: {
+				getProviderAuth: models.getAuth.bind(models),
+				getModelsOfType: models.getModelsOfType.bind(models),
+				refresh: models.refresh.bind(models),
+			},
+		};
+		await runCommand("", {
+			...ctx,
+			modelRegistry: {
+				...ctx.modelRegistry,
+				refresh: async (options: ModelsRefreshOptions) => {
+					const first = models.refresh(options);
+					await writeStarted;
+					await models.refresh({ providers: ["venice"], allowNetwork: false });
+					assert.deepEqual(models.getModels("venice").map((entry) => entry.id), ["old"]);
+					await runCommand("", ctx);
+					return first;
+				},
+			},
+		});
+
+		assert.deepEqual(notifications.map((notice) => notice.level), ["info", "warning"]);
+		assert.match(notifications[0]!.message, /Added: new/);
+		assert.match(notifications[1]!.message, /interrupted/);
+	});
+
 	it("refreshes only Venice, over the network, bypassing freshness checks", async () => {
 		const test = harness({ cached: [model("a")], fetched: [model("a"), model("b")] });
 		await test.run();
@@ -188,10 +274,11 @@ describe("/venice-refresh-models", () => {
 	});
 
 	it("says so when another refresh superseded this one", async () => {
-		const test = harness({ cached: [model("a")], fetches: false });
+		const test = harness({ cached: [model("a")], current: model("a", { input: 5 }), publishes: false });
 		await test.run();
 		assert.equal(test.notifications[0]?.level, "warning");
 		assert.match(test.notifications[0]!.message, /Run \/venice-refresh-models again/);
+		assert.equal(test.setModelCalls.length, 0);
 	});
 
 	it("applies a configured level the cached entry could not offer", async () => {
