@@ -12,6 +12,11 @@
  * Fallback keys come from numbered variables `VENICE_API_KEY_2`, `VENICE_API_KEY_3`, ... in the
  * process environment or a provider-scoped `env` entry in auth.json. By default the primary key is
  * used first; `/venice-key` can start from any configured key and remembers that choice.
+ *
+ * A key reaches Venice through `apiKey`, or through an `Authorization: Bearer <key>` header when
+ * Pi's `authHeader` setting copies the resolved key into one. That header outranks `apiKey` in the
+ * adapter, so it is switched along with the key. A request authenticated by any other
+ * `Authorization` value is forwarded as is: switching keys could not change its credential.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -24,7 +29,9 @@ import type {
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ProviderEnv,
+	ProviderHeaders,
 	ProviderStreams,
+	StreamOptions,
 } from "@earendil-works/pi-ai";
 import { getAgentDir, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 
@@ -360,17 +367,52 @@ function rotatedAttempt(
 	return out;
 }
 
+function authorizationHeaders(headers: ProviderHeaders | undefined): [string, string | null][] {
+	return Object.entries(headers ?? {}).filter(([name]) => name.toLowerCase() === "authorization");
+}
+
+function bearerToken(value: string | null): string | undefined {
+	return value === null ? undefined : /^bearer\s+(\S+)\s*$/i.exec(value)?.[1];
+}
+
+/**
+ * Whether an `Authorization` header (or a `null` that suppresses it) decides the credential instead
+ * of the resolved key. Switching `apiKey` would resend that same credential.
+ */
+function authorizedOutsideKey(options: StreamOptions | undefined): boolean {
+	return authorizationHeaders(options?.headers).some(([, value]) => bearerToken(value) !== options?.apiKey);
+}
+
+/** Options that authenticate with `apiKey`, including a header Pi's `authHeader` built from the resolved key. */
+function withApiKey<T extends StreamOptions>(options: T | undefined, apiKey: string): T {
+	const headers = options?.headers;
+	if (!headers || apiKey === options?.apiKey || authorizationHeaders(headers).length === 0) {
+		return { ...options, apiKey } as T;
+	}
+	const switched = Object.fromEntries(
+		Object.entries(headers).map(([name, value]) => [
+			name,
+			name.toLowerCase() === "authorization" ? `Bearer ${apiKey}` : value,
+		]),
+	);
+	return { ...options, apiKey, headers: switched } as T;
+}
+
 /** Wrap a provider's streams so a balance failure on one key transparently retries the next key. */
 export function withKeyRotation(api: ProviderStreams, keyring: Keyring = new Keyring()): ProviderStreams {
 	return {
 		...api,
 		stream: (model, context, options) => {
+			if (authorizedOutsideKey(options)) return api.stream(model, context, options);
 			const keys = candidateKeys(options?.apiKey, options?.env);
-			return rotatedAttempt(keys, keyring, (apiKey) => api.stream(model, context, { ...options, apiKey }));
+			return rotatedAttempt(keys, keyring, (apiKey) => api.stream(model, context, withApiKey(options, apiKey)));
 		},
 		streamSimple: (model, context, options) => {
+			if (authorizedOutsideKey(options)) return api.streamSimple(model, context, options);
 			const keys = candidateKeys(options?.apiKey, options?.env);
-			return rotatedAttempt(keys, keyring, (apiKey) => api.streamSimple(model, context, { ...options, apiKey }));
+			return rotatedAttempt(keys, keyring, (apiKey) =>
+				api.streamSimple(model, context, withApiKey(options, apiKey)),
+			);
 		},
 	};
 }
