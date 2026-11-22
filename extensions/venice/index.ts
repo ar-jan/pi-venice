@@ -1,8 +1,8 @@
 /**
  * Venice AI provider for Pi.
  *
- * - Auth: `/login venice` (stored in auth.json) or the VENICE_API_KEY environment variable.
- *   Logging in again adds the next key as a fallback (VENICE_API_KEY_2, ...); see keyring.ts.
+ * - Auth: `/login venice` (saved to Pi's active credential store) or the VENICE_API_KEY environment variable.
+ *   Fallback keys use numbered variables (VENICE_API_KEY_2, ...); see keyring.ts.
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
  *   support tool calling, and cached in models-store.json for offline use. E2EE-capable models are
  *   included and run in TEE-only mode: requests reach Venice as plaintext (see toPiModel).
@@ -36,7 +36,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	candidateKeys,
 	describeKeys,
-	isStoredCredentialAuth,
 	Keyring,
 	keyFingerprint,
 	loadPreferredKeyHash,
@@ -334,10 +333,7 @@ export function veniceApi(keyring: Keyring): ProviderStreams {
 export default function (pi: ExtensionAPI) {
 	const keyring = new Keyring(loadPreferredKeyHash());
 
-	// Login reads auth.json itself (pi's login API does not pass the stored credential) and asks
-	// pi's credential store, through the session's registry, whether a key is stored, so a failed
-	// read cannot replace the stored keys. Re-captured on every session start because a context
-	// goes stale after reload or session replacement.
+	// The registry belongs to the active session, which can change on reload or session replacement.
 	let registry: ExtensionContext["modelRegistry"] | undefined;
 	pi.on("session_start", (_event, ctx) => {
 		registry = ctx.modelRegistry;
@@ -345,8 +341,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		registry = undefined;
 	});
-	const hasStoredCredential = async () =>
-		registry ? isStoredCredentialAuth(await registry.getProviderAuth(PROVIDER_ID)) : undefined;
 
 	registerProviderWithRefreshCommand(
 		pi,
@@ -354,7 +348,7 @@ export default function (pi: ExtensionAPI) {
 			id: PROVIDER_ID,
 			name: "Venice AI",
 			baseUrl: BASE_URL,
-			auth: { apiKey: veniceApiKeyAuth(hasStoredCredential) },
+			auth: { apiKey: veniceApiKeyAuth(() => registry) },
 			models: [],
 			fetchModels: fetchVeniceModels,
 			api: veniceApi(keyring),
