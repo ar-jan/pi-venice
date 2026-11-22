@@ -354,6 +354,14 @@ describe("request body through the real adapter", () => {
 		assert.equal("prompt_cache_key" in received[1]!.body, false);
 	});
 
+	it("omits the cache key where a model override disables it", async () => {
+		const base = kimi();
+		const model = { ...base, compat: { ...base.compat, promptCacheKeyMode: "disabled" as const } };
+		await run(veniceApi(new Keyring()), model, userContext(), { apiKey: "key-1", sessionId: "session-1" });
+
+		assert.equal("prompt_cache_key" in received[0]!.body, false);
+	});
+
 	it("drops NUL bytes from a tool result before sending", async () => {
 		const model = kimi();
 		await run(veniceApi(new Keyring()), model, toolLoopContext(model, "ELF\u0000\u0000binary\u0000tail"), { apiKey: "key-1" });

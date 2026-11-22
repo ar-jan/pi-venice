@@ -92,7 +92,8 @@ supported one.
   for models that run in an attested enclave, e.g. `GLM 5.3 Flash (private, TEE)`.
 - Reasoning models send the system prompt with the OpenAI `developer` role, which Venice supports.
 - Requests carry a per-session `prompt_cache_key` so Venice can route to servers holding the cached
-  prefix (omitted when prompt caching is set to `none`).
+  prefix (omitted when prompt caching is set to `none`, or when a `modelOverrides` entry sets
+  `compat.promptCacheKeyMode` to `"disabled"`).
 - Claude requests carry their own cache breakpoints, so each tool result is written to the cache once
   instead of being billed as uncached input first (see [Claude prompt caching](#claude-prompt-caching)).
 - Venice reports cache writes as `cache_creation_input_tokens`, which Pi's OpenAI-completions adapter

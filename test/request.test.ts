@@ -89,6 +89,14 @@ describe("applyVeniceDefaults", () => {
 		assert.equal("prompt_cache_key" in optionOff, false);
 	});
 
+	it("omits the cache key only where the model's compat disables it", () => {
+		const keyFor = (promptCacheKeyMode: "auto" | "enabled" | "disabled") =>
+			(applyVeniceDefaults(body(), { sessionId: "s", promptCacheKeyMode }) as Record<string, unknown>).prompt_cache_key;
+		assert.equal(keyFor("disabled"), undefined);
+		assert.equal(keyFor("auto"), "s");
+		assert.equal(keyFor("enabled"), "s");
+	});
+
 	it("clamps the cache key to 64 characters", () => {
 		const result = applyVeniceDefaults(body(), { sessionId: "x".repeat(80) }) as Record<string, unknown>;
 		assert.equal(result.prompt_cache_key, "x".repeat(64));

@@ -52,6 +52,7 @@ import type {
 	AssistantMessageEventStream,
 	Model,
 	ModelThinkingLevel,
+	OpenAICompletionsCompat,
 	ProviderEnv,
 	ProviderStreams,
 	SamplingParams,
@@ -85,6 +86,8 @@ export interface VeniceRequestContext {
 	cacheBreakpoints?: boolean;
 	/** Images allowed across the request; defaults to VENICE_MAX_IMAGES_PER_REQUEST. */
 	maxImagesPerRequest?: number;
+	/** The model's `compat.promptCacheKeyMode`; "disabled" omits `prompt_cache_key`. */
+	promptCacheKeyMode?: OpenAICompletionsCompat["promptCacheKeyMode"];
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -247,8 +250,15 @@ function resolveCacheRetention(context: VeniceRequestContext): "none" | "short" 
 	return fromEnv === "long" ? "long" : "short";
 }
 
+/**
+ * The session's cache key, added here rather than with `compat.promptCacheKeyMode: "enabled"`, which
+ * would make pi send the same key: compat is cached in models-store.json, which print mode only
+ * reads, so entries cached without the flag would send no key, and pi before 1.5.1 ignores it.
+ * A "disabled" mode (set through `modelOverrides`) is honored, as pi's own adapters do.
+ */
 function promptCacheKey(context: VeniceRequestContext): string | undefined {
-	if (!context.sessionId || resolveCacheRetention(context) === "none") return undefined;
+	if (!context.sessionId || context.promptCacheKeyMode === "disabled") return undefined;
+	if (resolveCacheRetention(context) === "none") return undefined;
 	return Array.from(context.sessionId).slice(0, PROMPT_CACHE_KEY_MAX_LENGTH).join("");
 }
 
@@ -418,7 +428,8 @@ function limitImages(messages: unknown[], maxImages: number): unknown[] {
  *   layers win per key. A non-object value in the body is left for Venice to reject; non-object
  *   layers are skipped.
  * - `prompt_cache_key` from the session ID, so Venice routes the session to servers holding its
- *   cached prefix. Skipped when the body already has one or prompt caching is off.
+ *   cached prefix. Skipped when the body already has one, prompt caching is off, or the model's
+ *   `compat.promptCacheKeyMode` is "disabled".
  * - Claude cache breakpoints when `cacheBreakpoints` is set (see withCacheBreakpoints), unless
  *   prompt caching is off.
  */
@@ -484,6 +495,7 @@ function withDefaults<T extends StreamOptions>(
 				disableThinking,
 				cacheBreakpoints: usesExplicitCacheBreakpoints(model),
 				maxImagesPerRequest: model.inputLimits?.images?.maxPerRequest,
+				promptCacheKeyMode: (model as Model<"openai-completions">).compat?.promptCacheKeyMode,
 			});
 			// Extension `before_provider_request` hooks arrive here and see the prepared body.
 			const replaced = await callerOnPayload?.(prepared, model);
