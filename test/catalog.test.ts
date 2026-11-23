@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
-import { createModels, getSupportedThinkingLevels, InMemoryCredentialStore, type Provider } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, InMemoryCredentialStore, type Provider } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import registerVenice, { toPiModel } from "../extensions/venice/index.ts";
 
 type Capabilities = Record<string, unknown>;
@@ -25,27 +29,37 @@ function veniceModel(
 }
 
 describe("catalog refresh", () => {
-	it("sends the bearer key to the configured provider endpoint", async (t) => {
+	it("uses the provider base URL from models.json for catalog discovery", async (t) => {
+		const agentDir = await mkdtemp(join(tmpdir(), "pi-venice-catalog-"));
+		t.after(() => rm(agentDir, { recursive: true, force: true }));
+		const modelsPath = join(agentDir, "models.json");
+		const baseUrl = "https://gateway.example/venice/v1/";
+		await writeFile(modelsPath, JSON.stringify({ providers: { venice: { baseUrl } } }));
+
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("venice", async () => ({ type: "api_key", key: "gateway-key" }));
-		const models = createModels({ credentials });
+		const runtime = await ModelRuntime.create({ credentials, modelsPath });
+		const registry = new ModelRegistry(runtime);
+		const refresh = t.mock.method(runtime, "refresh");
 		registerVenice({
 			on() {},
 			registerCommand() {},
 			registerProvider(provider: Provider) {
-				models.setProvider({ ...provider, baseUrl: "https://gateway.example/venice/v1/" });
+				registry.registerProvider(provider);
 			},
 		} as never);
+		// Let the cache-only refresh triggered by registration finish before refreshing over the network.
+		await refresh.mock.calls[0]?.result;
 		const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [veniceModel()] }));
 
-		const result = await models.refresh({ providers: ["venice"], allowNetwork: true });
+		const result = await registry.refresh({ providers: ["venice"], allowNetwork: true });
 
 		assert.equal(result.errors.size, 0);
 		assert.equal(fetch.mock.callCount(), 1);
 		const [url, options] = fetch.mock.calls[0]!.arguments;
 		assert.equal(String(url), "https://gateway.example/venice/v1/models?type=text");
 		assert.equal(new Headers(options?.headers).get("authorization"), "Bearer gateway-key");
-		assert.ok(models.getModel("venice", "grok-4-20"));
+		assert.equal(registry.find("venice", "grok-4-20")?.baseUrl, baseUrl);
 	});
 });
 

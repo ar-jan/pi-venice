@@ -105,6 +105,18 @@ pi -p /venice-refresh-models
 Like `pi update --models`, it fetches even with `--offline` or `PI_OFFLINE` set, since it is an
 explicit request.
 
+For a Venice-compatible gateway, set `providers.venice.baseUrl` in `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "venice": { "baseUrl": "https://gateway.example/venice/v1" }
+  }
+}
+```
+
+Pi uses that base URL for chat, and catalog discovery requests `/models?type=text` under the same URL.
+
 ## Features
 
 - Models are fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
