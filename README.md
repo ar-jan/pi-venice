@@ -4,6 +4,8 @@
 
 ## Install
 
+Requires Pi 1.6.1 or later.
+
 ```bash
 pi install git:github.com/ar-jan/pi-venice
 ```
