@@ -49,34 +49,58 @@ const assistant = (text: string): AssistantMessage => ({
 	timestamp: Date.now(),
 });
 
-const outcome = (kind: "done" | "started-error" | "error", message: string): AssistantMessageEventStream => {
+/**
+ * One fake attempt: its events, and the HTTP status it reports, or one per response when the adapter
+ * retried the request itself (none when no response arrived).
+ */
+interface Outcome {
+	kind: "done" | "started-error" | "error";
+	message: string;
+	status?: number | number[];
+}
+
+const outcome = (kind: Outcome["kind"], message: string, status?: Outcome["status"]): Outcome => ({
+	kind,
+	message,
+	status,
+});
+
+/** Venice's 402 for a key without balance, as pi's adapter reports it. */
+const paymentRequired = () =>
+	outcome("error", "402 \"Insufficient USD or Diem balance to complete request.\"", 402);
+
+/** Play an outcome the way pi's adapters do: each HTTP status reaches `onResponse` before any event. */
+function play({ kind, message, status }: Outcome, options: StreamOptions | undefined): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const result = assistant(message);
-	if (kind === "done") {
-		stream.push({ type: "start", partial: result });
-		stream.push({ type: "done", reason: "stop", message: result });
-	} else {
-		if (kind === "started-error") stream.push({ type: "start", partial: result });
-		stream.push({
-			type: "error",
-			reason: "error",
-			error: { ...result, stopReason: "error", errorMessage: message },
-		});
-	}
-	stream.end();
+	void (async () => {
+		for (const each of [status ?? []].flat()) await options?.onResponse?.({ status: each, headers: {} }, model);
+		if (kind === "done") {
+			stream.push({ type: "start", partial: result });
+			stream.push({ type: "done", reason: "stop", message: result });
+		} else {
+			if (kind === "started-error") stream.push({ type: "start", partial: result });
+			stream.push({
+				type: "error",
+				reason: "error",
+				error: { ...result, stopReason: "error", errorMessage: message },
+			});
+		}
+		stream.end();
+	})();
 	return stream;
-};
+}
 
 /** Fake provider that records the key and headers each attempt used. */
 function fakeApi(
-	respond: (apiKey: string | undefined) => AssistantMessageEventStream,
+	respond: (apiKey: string | undefined) => Outcome,
 ): ProviderStreams & { calls: (string | undefined)[]; headers: (ProviderHeaders | undefined)[] } {
 	const calls: (string | undefined)[] = [];
 	const headers: (ProviderHeaders | undefined)[] = [];
 	const produce = (options: StreamOptions | undefined) => {
 		calls.push(options?.apiKey);
 		headers.push(options?.headers);
-		return respond(options?.apiKey);
+		return play(respond(options?.apiKey), options);
 	};
 	return {
 		calls,
@@ -151,10 +175,8 @@ describe("candidateKeys", () => {
 describe("withKeyRotation", () => {
 	const fallback = { VENICE_API_KEY_2: "key-2" };
 
-	it("retries on the fallback key when Venice reports insufficient balance", async () => {
-		const api = fakeApi((key) =>
-			key === "key-1" ? outcome("error", "402: {\"code\":\"INSUFFICIENT_BALANCE\"}") : outcome("done", "ok"),
-		);
+	it("retries on the fallback key when Venice answers HTTP 402", async () => {
+		const api = fakeApi((key) => (key === "key-1" ? paymentRequired() : outcome("done", "ok", 200)));
 		const rotated = withKeyRotation(api);
 		const result = await drain(call(rotated, options("key-1", fallback)));
 
@@ -164,7 +186,7 @@ describe("withKeyRotation", () => {
 	});
 
 	it("keeps using the fallback key for later requests", async () => {
-		const api = fakeApi((key) => (key === "key-1" ? outcome("error", "402 Payment Required") : outcome("done", "ok")));
+		const api = fakeApi((key) => (key === "key-1" ? paymentRequired() : outcome("done", "ok", 200)));
 		const rotated = withKeyRotation(api);
 
 		await drain(call(rotated, options("key-1", fallback)));
@@ -173,30 +195,39 @@ describe("withKeyRotation", () => {
 		assert.deepEqual(api.calls, ["key-1", "key-2", "key-2"]);
 	});
 
-	it("does not retry a balance failure after the response started", async () => {
-		const api = fakeApi(() => outcome("started-error", "402: insufficient balance"));
+	it("decides on the last status when the adapter retried the request itself", async () => {
+		const api = fakeApi((key) => {
+			if (key === "key-1") return { ...paymentRequired(), status: [429, 402] };
+			// A rate limit that the adapter retried until it gave up is not a balance failure.
+			return outcome("error", "429 Too Many Requests", [402, 429]);
+		});
 		const rotated = withKeyRotation(api);
-		const result = await drain(call(rotated, options("key-1", fallback)));
-
-		assert.deepEqual(api.calls, ["key-1"]);
-		assert.equal(result.stopReason, "error");
-	});
-
-	it("remembers the next key after a late balance failure without replaying", async () => {
-		const api = fakeApi((key) =>
-			key === "key-1" ? outcome("started-error", "402: insufficient balance") : outcome("done", "ok"),
-		);
-		const rotated = withKeyRotation(api);
-
-		await drain(call(rotated, options("key-1", fallback)));
 		const result = await drain(call(rotated, options("key-1", fallback)));
 
 		assert.deepEqual(api.calls, ["key-1", "key-2"]);
-		assert.equal(result.stopReason, "stop");
+		assert.match(result.errorMessage ?? "", /^429\b/);
 	});
 
+	// Only the HTTP status counts, never the error text.
+	for (const [name, failure] of [
+		["balance wording inside a response that already streams", outcome("started-error", "402 INSUFFICIENT_BALANCE", 200)],
+		["an unrelated error that mentions 402", outcome("error", "400 max_completion_tokens must be at most 402", 400)],
+		["an error without an HTTP response", outcome("error", "402: insufficient balance")],
+	] as const) {
+		it(`does not switch keys on ${name}`, async () => {
+			const api = fakeApi(() => failure);
+			const rotated = withKeyRotation(api);
+
+			const result = await drain(call(rotated, options("key-1", fallback)));
+			await drain(call(rotated, options("key-1", fallback)));
+
+			assert.deepEqual(api.calls, ["key-1", "key-1"]);
+			assert.equal(result.stopReason, "error");
+		});
+	}
+
 	it("does not retry unrelated errors", async () => {
-		const api = fakeApi(() => outcome("error", "500: internal server error"));
+		const api = fakeApi(() => outcome("error", "500: internal server error", 500));
 		const rotated = withKeyRotation(api);
 		const result = await drain(call(rotated, options("key-1", fallback)));
 
@@ -205,16 +236,16 @@ describe("withKeyRotation", () => {
 	});
 
 	it("passes the balance error through when no fallback is configured", async () => {
-		const api = fakeApi(() => outcome("error", "402: insufficient balance"));
+		const api = fakeApi(() => paymentRequired());
 		const rotated = withKeyRotation(api);
 		const result = await drain(call(rotated, options("key-1")));
 
 		assert.deepEqual(api.calls, ["key-1"]);
-		assert.match(result.errorMessage ?? "", /402/);
+		assert.match(result.errorMessage ?? "", /^402\b/);
 	});
 
 	it("retries the primary key on a later request when every key failed", async () => {
-		const api = fakeApi(() => outcome("error", "402: insufficient balance"));
+		const api = fakeApi(() => paymentRequired());
 		const rotated = withKeyRotation(api);
 
 		await drain(call(rotated, options("key-1", fallback)));
@@ -224,12 +255,27 @@ describe("withKeyRotation", () => {
 	});
 
 	it("rotates streamSimple requests too", async () => {
-		const api = fakeApi((key) => (key === "key-1" ? outcome("error", "402") : outcome("done", "ok")));
+		const api = fakeApi((key) => (key === "key-1" ? paymentRequired() : outcome("done", "ok", 200)));
 		const rotated = withKeyRotation(api);
 		const result = await drain(simpleCall(rotated, { apiKey: "key-1", env: fallback }));
 
 		assert.deepEqual(api.calls, ["key-1", "key-2"]);
 		assert.equal(result.stopReason, "stop");
+	});
+
+	it("still reports every attempt's response to the caller's onResponse", async () => {
+		const api = fakeApi((key) => (key === "key-1" ? paymentRequired() : outcome("done", "ok", 200)));
+		const statuses: number[] = [];
+		await drain(
+			call(withKeyRotation(api), {
+				...options("key-1", fallback),
+				onResponse: (response) => {
+					statuses.push(response.status);
+				},
+			}),
+		);
+
+		assert.deepEqual(statuses, [402, 200]);
 	});
 
 	describe("with an Authorization header", () => {
@@ -239,7 +285,7 @@ describe("withKeyRotation", () => {
 			headers,
 		});
 		const balanceFailureOnKey1 = (key: string | undefined) =>
-			key === "key-1" ? outcome("error", "402 Payment Required") : outcome("done", "ok");
+			key === "key-1" ? paymentRequired() : outcome("done", "ok", 200);
 
 		it("switches the header Pi's authHeader built from the resolved key", async () => {
 			const api = fakeApi(balanceFailureOnKey1);
@@ -276,7 +322,7 @@ describe("withKeyRotation", () => {
 			it(`forwards a request authorized by ${JSON.stringify(value)} without rotating`, async () => {
 				const keyring = new Keyring();
 				keyring.choose("key-2");
-				const api = fakeApi(() => outcome("error", "402 Payment Required"));
+				const api = fakeApi(() => paymentRequired());
 				const rotated = withKeyRotation(api, keyring);
 
 				const result = await drain(call(rotated, withHeaders("key-1", { Authorization: value })));

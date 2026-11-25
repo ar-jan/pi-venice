@@ -5,9 +5,13 @@
  * `/login venice` credential or `VENICE_API_KEY`. Venice answers a request whose key has no
  * USD/DIEM balance left with HTTP 402 (`INSUFFICIENT_BALANCE`) before any stream content.
  *
- * This wrapper turns that failure into a transparent retry on the next key. Normal requests are
- * forwarded unchanged; only a 402 before the response starts switches keys. The switched key is
- * remembered for the process lifetime, so later requests do not hit the exhausted key again.
+ * This wrapper turns that failure into a transparent retry on the next key. Normal requests keep
+ * their key and callbacks; only a response with HTTP status 402 switches keys. The status comes from
+ * `onResponse`, which pi calls for error responses too since 1.6.1 (earlier versions report only
+ * successful ones, so they never rotate). Error text is never matched: balance wording inside a
+ * response that already streams, or an unrelated error that mentions 402, leaves the key alone. The
+ * switched key is remembered for the process lifetime, so later requests do not hit the exhausted key
+ * again.
  *
  * Fallback keys come from numbered variables `VENICE_API_KEY_2`, `VENICE_API_KEY_3`, ... in the
  * process environment or a provider-scoped `env` entry in auth.json. By default the primary key is
@@ -25,11 +29,14 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
+	Api,
 	ApiKeyAuth,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
+	Model,
 	ProviderEnv,
 	ProviderHeaders,
+	ProviderResponse,
 	ProviderStreams,
 	StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -47,12 +54,12 @@ function fallbackIndex(name: string): number | undefined {
 }
 
 /**
- * Venice documents these 402 codes for a key that cannot pay for the request:
+ * The HTTP status of a request whose key cannot pay for it. Venice documents three codes with it:
  * `INSUFFICIENT_BALANCE`, `API_KEY_DIEM_SPEND_LIMIT_EXCEEDED`, and
- * `API_KEY_USD_SPEND_LIMIT_EXCEEDED`. Any other 402 is Venice's payment path too, so matching the
- * status is both narrower than "any error" and broad enough for new balance codes.
+ * `API_KEY_USD_SPEND_LIMIT_EXCEEDED`. Any other 402 is Venice's payment path too, so the status
+ * alone decides: narrower than "any error" and broad enough for new balance codes.
  */
-const BALANCE_FAILURE = /\b402\b|INSUFFICIENT_BALANCE|SPEND_LIMIT_EXCEEDED/i;
+const PAYMENT_REQUIRED = 402;
 
 /**
  * Fallback keys in index order. A provider-scoped value (auth.json `env`) wins over the process
@@ -256,10 +263,6 @@ export function savePreferredKeyHash(hash: string): void {
 	}
 }
 
-function isBalanceFailure(event: AssistantMessageEvent): boolean {
-	return event.type === "error" && BALANCE_FAILURE.test(event.error.errorMessage ?? "");
-}
-
 function errorEvent(message: string): AssistantMessageEvent {
 	return {
 		type: "error",
@@ -286,14 +289,15 @@ function errorEvent(message: string): AssistantMessageEvent {
 }
 
 /**
- * Drive one request, retrying on a different key when Venice rejects it for insufficient balance.
- * A retry is only possible before the response started; once content has been forwarded, a late
- * failure is passed through like any other error.
+ * Drive one request, retrying on a different key when Venice rejects it with HTTP 402. `produce`
+ * starts an attempt and reports each HTTP status it receives. The adapter reports the status before
+ * it streams anything, so a 402 attempt has forwarded no events and can be retried as if it never
+ * happened. Every other failure is passed through.
  */
 function rotatedAttempt(
 	keys: readonly string[],
 	keyring: Keyring,
-	produce: (apiKey: string) => AssistantMessageEventStream,
+	produce: (apiKey: string, observeStatus: (status: number) => void) => AssistantMessageEventStream,
 ): AssistantMessageEventStream {
 	const out = createAssistantMessageEventStream();
 
@@ -309,16 +313,19 @@ function rotatedAttempt(
 		let index = keys.indexOf(first);
 		for (;;) {
 			const key = keys[index]!;
+			// The last status wins: the adapter's own retries (429, 5xx) report one status per attempt.
+			const response: { status?: number } = {};
 			let attempt: AssistantMessageEventStream;
 			try {
-				attempt = produce(key);
+				attempt = produce(key, (status) => {
+					response.status = status;
+				});
 			} catch (thrown) {
 				out.push(errorEvent(thrown instanceof Error ? thrown.message : String(thrown)));
 				out.end();
 				return;
 			}
 
-			let started = false;
 			let failure: AssistantMessageEvent | undefined;
 			let terminal = false;
 			try {
@@ -327,7 +334,6 @@ function rotatedAttempt(
 						failure = event;
 						break;
 					}
-					if (event.type === "start") started = true;
 					out.push(event);
 					if (event.type === "done") {
 						terminal = true;
@@ -345,9 +351,9 @@ function rotatedAttempt(
 			}
 
 			if (failure) {
-				const balanceFailure = isBalanceFailure(failure);
+				const balanceFailure = response.status === PAYMENT_REQUIRED;
 				const next = balanceFailure ? keyring.rotate(keys, key) : undefined;
-				if (next && !started) {
+				if (next) {
 					index = keys.indexOf(next);
 					continue;
 				}
@@ -398,20 +404,41 @@ function withApiKey<T extends StreamOptions>(options: T | undefined, apiKey: str
 	return { ...options, apiKey, headers: switched } as T;
 }
 
-/** Wrap a provider's streams so a balance failure on one key transparently retries the next key. */
+/**
+ * Options for one attempt on `apiKey` that report each HTTP status to `observeStatus`, then to the
+ * caller's `onResponse`, so pi still sees every attempt's response, including a rotated-away 402.
+ */
+function attemptOptions<T extends StreamOptions>(
+	options: T | undefined,
+	apiKey: string,
+	observeStatus: (status: number) => void,
+): T {
+	const callerOnResponse = options?.onResponse;
+	return {
+		...withApiKey(options, apiKey),
+		onResponse: async (response: ProviderResponse, model: Model<Api>) => {
+			observeStatus(response.status);
+			await callerOnResponse?.(response, model);
+		},
+	} as T;
+}
+
+/** Wrap a provider's streams so an HTTP 402 on one key transparently retries the next key. */
 export function withKeyRotation(api: ProviderStreams, keyring: Keyring = new Keyring()): ProviderStreams {
 	return {
 		...api,
 		stream: (model, context, options) => {
 			if (authorizedOutsideKey(options)) return api.stream(model, context, options);
 			const keys = candidateKeys(options?.apiKey, options?.env);
-			return rotatedAttempt(keys, keyring, (apiKey) => api.stream(model, context, withApiKey(options, apiKey)));
+			return rotatedAttempt(keys, keyring, (apiKey, observeStatus) =>
+				api.stream(model, context, attemptOptions(options, apiKey, observeStatus)),
+			);
 		},
 		streamSimple: (model, context, options) => {
 			if (authorizedOutsideKey(options)) return api.streamSimple(model, context, options);
 			const keys = candidateKeys(options?.apiKey, options?.env);
-			return rotatedAttempt(keys, keyring, (apiKey) =>
-				api.streamSimple(model, context, withApiKey(options, apiKey)),
+			return rotatedAttempt(keys, keyring, (apiKey, observeStatus) =>
+				api.streamSimple(model, context, attemptOptions(options, apiKey, observeStatus)),
 			);
 		},
 	};

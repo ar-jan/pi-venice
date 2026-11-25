@@ -47,11 +47,16 @@ environment for the same fallback number.
 ```
 
 Rotation is transparent and costs no extra requests in normal use: when Venice rejects a request
-with HTTP 402 (`INSUFFICIENT_BALANCE`, `API_KEY_USD_SPEND_LIMIT_EXCEEDED`, or
-`API_KEY_DIEM_SPEND_LIMIT_EXCEEDED`) before the response starts, the request is retried once on the
-next key. The switch is remembered for the process lifetime, so later requests go straight to the
-working key. When every key fails, the next request returns to your selected key, or the primary
-when none is selected.
+with HTTP status 402 (`INSUFFICIENT_BALANCE`, `API_KEY_USD_SPEND_LIMIT_EXCEEDED`, or
+`API_KEY_DIEM_SPEND_LIMIT_EXCEEDED`), the request is retried once on the next key. The switch is
+remembered for the process lifetime, so later requests go straight to the working key. When every
+key fails, the next request returns to your selected key, or the primary when none is selected.
+Restart Pi to retry the primary key after topping it up.
+
+Only the HTTP status counts, never the error text: an error that mentions a balance or 402, such as
+one inside a response that has already started streaming, does not switch keys. Rotation needs Pi
+1.6.1 or later, the first version that reports the status of failed responses to the provider;
+older versions pass the 402 through without trying the next key.
 
 Venice does not need Pi's `authHeader` setting, since the key is already sent as
 `Authorization: Bearer`. If it is set, the header follows the key through failover and `/venice-key`.
@@ -64,10 +69,6 @@ credential is sent as configured and never rotated: switching keys could not cha
 is persisted in `~/.pi/agent/venice-keys.json` as a SHA-256 fingerprint (not the key itself) and is
 restored on the next start. Automatic failover still advances to the next key; when all keys fail,
 the next request returns to your selected key. Run `/venice-key 1` to go back to the primary.
-
-A 402 that arrives after content has streamed cannot be replayed; the error is passed through, but
-the next key is still remembered for later requests. Restart Pi to retry the primary key after
-topping it up.
 
 ## Update
 

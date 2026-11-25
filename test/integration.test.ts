@@ -597,7 +597,7 @@ describe("key rotation through the real adapter", () => {
 		assert.match(message.errorMessage ?? "", /^400\b/);
 	});
 
-	it("passes a balance failure after streaming started through, then uses the next key", async () => {
+	it("keeps the key on balance wording inside a response that already streams", async () => {
 		respond = (request, res) => {
 			if (request.key !== "key-1") return streamText(res, "ok");
 			sse(res, [
@@ -608,14 +608,26 @@ describe("key rotation through the real adapter", () => {
 		const api = veniceApi(new Keyring());
 
 		const first = await run(api, kimi(), userContext(), options());
-		const second = await run(api, kimi(), userContext(), options());
+		await run(api, kimi(), userContext(), options());
 
+		// The response was HTTP 200, and error text is never matched.
 		assert.equal(first.message.stopReason, "error");
 		assert.equal(first.message.content.find((block) => block.type === "text")?.text, "Hel");
-		assert.equal(second.message.stopReason, "stop");
 		assert.deepEqual(
 			received.map((request) => request.key),
-			["key-1", "key-2"],
+			["key-1", "key-1"],
 		);
+	});
+
+	it("reports both the rotated-away 402 and the retried response to onResponse", async () => {
+		respond = (request, res) => (request.key === "key-1" ? insufficientBalance(res) : streamText(res, "ok"));
+		const statuses: number[] = [];
+		await run(veniceApi(new Keyring()), kimi(), userContext(), options({
+			onResponse: (response) => {
+				statuses.push(response.status);
+			},
+		}));
+
+		assert.deepEqual(statuses, [402, 200]);
 	});
 });
