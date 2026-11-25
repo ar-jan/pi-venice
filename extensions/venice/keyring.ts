@@ -117,17 +117,17 @@ export function veniceApiKeyAuth(getRegistry: () => ModelRegistry | undefined): 
 	async function replaceableEnv(registry: ModelRegistry): Promise<ProviderEnv | undefined> {
 		const check: LoginCheck = { observed: false };
 		// A runtime override hides the stored entry from resolution. Any other status is only a snapshot.
-		if (registry.getProviderAuthStatus("venice").source !== "runtime") {
-			await loginCheck.run(check, () => registry.getProviderAuth("venice"));
-		}
+		const resolved = registry.getProviderAuthStatus("venice").source === "runtime"
+			? undefined
+			: await loginCheck.run(check, () => registry.getProviderAuth("venice"));
 		if (!check.observed || check.stored?.key) {
 			throw new Error(
 				"Login can only set the first Venice key. To add a fallback, set the next unused VENICE_API_KEY_N (starting at 2) in the environment or in the active Venice credential's env.",
 			);
 		}
-		// A stored entry without a key also falls back to VENICE_API_KEY, so the environment decides there too.
-		if (process.env.VENICE_API_KEY) {
-			const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(undefined)}`;
+		// Without a usable stored key, the resolver can still supply VENICE_API_KEY.
+		if (resolved?.auth.apiKey) {
+			const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(check.stored?.env)}`;
 			throw new Error(
 				`VENICE_API_KEY is set, so Venice is configured from the environment and a stored key would override it. Add a fallback with: export ${name}=<key>`,
 			);
@@ -152,6 +152,7 @@ export function veniceApiKeyAuth(getRegistry: () => ModelRegistry | undefined): 
 			if (!registry) throw new Error(UNVERIFIED_STORE);
 			await replaceableEnv(registry);
 			const credential = await base.login!(interaction);
+			if (!credential.key?.trim()) throw new Error("Venice API key cannot be blank.");
 			// Another process can change the entry while the prompt is open. Keep the env it has now.
 			const env = await replaceableEnv(registry);
 			interaction.signal.throwIfAborted();

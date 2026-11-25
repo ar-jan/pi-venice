@@ -138,12 +138,25 @@ async function drain(stream: AssistantMessageEventStream): Promise<AssistantMess
 	return await stream.result();
 }
 
-describe("candidateKeys", () => {
-	afterEach(() => {
-		delete process.env.VENICE_API_KEY_2;
-		delete process.env.VENICE_API_KEY_3;
-	});
+// Keep shell credentials out of key lists and assertion output.
+function keyEnvNames(): string[] {
+	return Object.keys(process.env).filter((name) => /^(?:VENICE_API_KEY(?:_\d+)?|PV_TEST_UNSET_KEY)$/i.test(name));
+}
 
+let savedKeyEnv: NodeJS.ProcessEnv;
+
+beforeEach(() => {
+	const names = keyEnvNames();
+	savedKeyEnv = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+	for (const name of names) delete process.env[name];
+});
+
+afterEach(() => {
+	for (const name of keyEnvNames()) delete process.env[name];
+	Object.assign(process.env, savedKeyEnv);
+});
+
+describe("candidateKeys", () => {
 	it("uses the primary key alone when no fallback is configured", () => {
 		assert.deepEqual(candidateKeys("key-1", undefined), ["key-1"]);
 	});
@@ -401,7 +414,6 @@ describe("preferred key persistence", () => {
 
 describe("Venice login through Pi's credential store", () => {
 	const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
-	const savedPrimary = process.env.VENICE_API_KEY;
 	const tempDirs: string[] = [];
 	const a = { type: "api_key", key: "a-1", env: { VENICE_API_KEY_2: "a-2" } } as const;
 	const b = { type: "api_key", key: "b-1", env: { VENICE_API_KEY_2: "b-2" } } as const;
@@ -443,15 +455,12 @@ describe("Venice login through Pi's credential store", () => {
 		defaultDir = profile(a);
 		defaultAuthPath = join(defaultDir, "auth.json");
 		process.env.PI_CODING_AGENT_DIR = defaultDir;
-		delete process.env.VENICE_API_KEY;
 	});
 
 	afterEach(() => {
 		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 		if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
-		if (savedPrimary === undefined) delete process.env.VENICE_API_KEY;
-		else process.env.VENICE_API_KEY = savedPrimary;
 	});
 
 	it("protects both profiles when the alternate profile already has a primary and fallback", async (t) => {
@@ -546,15 +555,37 @@ describe("Venice login through Pi's credential store", () => {
 		});
 	});
 
-	it("keeps an environment-configured user's stored key that does not resolve", async (t) => {
+	it("rejects blank submissions without changing the stored reference or its fallbacks", async (t) => {
+		const contents = JSON.stringify({ venice: { ...a, key: "$PV_TEST_UNSET_KEY" } });
+		writeFileSync(defaultAuthPath, contents);
+		const runtime = await veniceRuntime(t);
+
+		for (const answer of ["", " \t "]) {
+			await assert.rejects(runtime.login("venice", "api_key", interaction(answer)), /key cannot be blank/i);
+			assert.equal(readFileSync(defaultAuthPath, "utf8"), contents);
+		}
+	});
+
+	it("repairs an unresolved key when VENICE_API_KEY is whitespace only", async (t) => {
+		writeFileSync(defaultAuthPath, JSON.stringify({ venice: { ...a, key: "$PV_TEST_UNSET_KEY" } }));
+		process.env.VENICE_API_KEY = " \t ";
+		const runtime = await veniceRuntime(t);
+
+		await runtime.login("venice", "api_key", interaction("new-key"));
+
+		assert.deepEqual(JSON.parse(readFileSync(defaultAuthPath, "utf8")), { venice: { ...a, key: "new-key" } });
+	});
+
+	it("keeps the unresolved credential and suggests a fallback free in both environments", async (t) => {
 		const contents = JSON.stringify({ venice: { type: "api_key", key: "!false", env: a.env } });
 		writeFileSync(defaultAuthPath, contents);
 		process.env.VENICE_API_KEY = "env-primary";
+		process.env.VENICE_API_KEY_3 = "env-3";
 		const runtime = await veniceRuntime(t);
-		// Without a stored key, Pi resolves VENICE_API_KEY, which a new stored key would override.
+		// Pi uses the environment primary while the stored reference is unresolved.
 		assert.equal((await runtime.getAuth("venice"))?.auth.apiKey, "env-primary");
 
-		await assert.rejects(runtime.login("venice", "api_key", interaction()), /export VENICE_API_KEY_2=<key>/);
+		await assert.rejects(runtime.login("venice", "api_key", interaction()), /export VENICE_API_KEY_4=<key>/);
 		assert.equal(readFileSync(defaultAuthPath, "utf8"), contents);
 	});
 
@@ -631,11 +662,6 @@ describe("Venice login through Pi's credential store", () => {
 });
 
 describe("nextFallbackIndex", () => {
-	afterEach(() => {
-		delete process.env.VENICE_API_KEY_2;
-		delete process.env.VENICE_API_KEY_4;
-	});
-
 	it("skips indices already present in either environment", () => {
 		process.env.VENICE_API_KEY_2 = "key-2";
 		assert.equal(nextFallbackIndex({ VENICE_API_KEY_4: "key-4" }), 3);
