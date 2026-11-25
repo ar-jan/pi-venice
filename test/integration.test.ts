@@ -630,4 +630,61 @@ describe("key rotation through the real adapter", () => {
 
 		assert.deepEqual(statuses, [402, 200]);
 	});
+
+	it("preserves a response hook error on a 402 and keeps the active key", async () => {
+		respond = (_request, res) => received.length === 1 ? insufficientBalance(res) : streamText(res, "ok");
+		const api = veniceApi(new Keyring());
+		const { message } = await run(api, kimi(), userContext(), options({
+			onResponse: async ({ status }) => {
+				if (status === 402) throw new Error("response hook failed");
+			},
+		}));
+		const next = await run(api, kimi(), userContext(), options());
+
+		assert.equal(message.stopReason, "error");
+		assert.match(message.errorMessage ?? "", /response hook failed/);
+		assert.equal(next.message.stopReason, "stop");
+		assert.deepEqual(received.map((request) => request.key), ["key-1", "key-1"]);
+	});
+
+	it("keeps the active key when the caller aborts on a 402", async () => {
+		respond = (_request, res) => received.length === 1 ? insufficientBalance(res) : streamText(res, "ok");
+		const api = veniceApi(new Keyring());
+		const controller = new AbortController();
+		const { message } = await run(api, kimi(), userContext(), options({
+			signal: controller.signal,
+			onResponse: ({ status }) => {
+				if (status === 402) controller.abort();
+			},
+		}));
+		const next = await run(api, kimi(), userContext(), options());
+
+		assert.equal(message.stopReason, "aborted");
+		assert.equal(next.message.stopReason, "stop");
+		assert.deepEqual(received.map((request) => request.key), ["key-1", "key-1"]);
+	});
+
+	it("preserves a connection failure on Pi's retry after a 402 and keeps the active key", async (t) => {
+		respond = (_request, res) => {
+			if (received.length === 1) {
+				res.setHeader("x-should-retry", "true");
+				res.setHeader("retry-after-ms", "1");
+				insufficientBalance(res);
+			} else if (received.length === 2) {
+				res.destroy();
+			} else {
+				streamText(res, "ok");
+			}
+		};
+		const api = veniceApi(new Keyring());
+		const fetch = t.mock.fn(globalThis.fetch);
+		const { message } = await run(api, kimi(), userContext(), options({ maxRetries: 1, fetch }));
+		const next = await run(api, kimi(), userContext(), options());
+
+		assert.equal(message.stopReason, "error");
+		assert.match(message.errorMessage ?? "", /connection/i);
+		assert.equal(fetch.mock.callCount(), 2);
+		assert.equal(next.message.stopReason, "stop");
+		assert.deepEqual(received.map((request) => request.key), ["key-1", "key-1", "key-1"]);
+	});
 });

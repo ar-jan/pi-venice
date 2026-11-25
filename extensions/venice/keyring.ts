@@ -29,14 +29,11 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
-	Api,
 	ApiKeyAuth,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
-	Model,
 	ProviderEnv,
 	ProviderHeaders,
-	ProviderResponse,
 	ProviderStreams,
 	StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -263,7 +260,9 @@ export function savePreferredKeyHash(hash: string): void {
 	}
 }
 
-function errorEvent(message: string): AssistantMessageEvent {
+type StreamErrorEvent = Extract<AssistantMessageEvent, { type: "error" }>;
+
+function errorEvent(message: string): StreamErrorEvent {
 	return {
 		type: "error",
 		reason: "error",
@@ -289,18 +288,18 @@ function errorEvent(message: string): AssistantMessageEvent {
 }
 
 /**
- * Drive one request, retrying on a different key when Venice rejects it with HTTP 402. `produce`
- * starts an attempt and reports each HTTP status it receives. The adapter reports the status before
- * it streams anything, so a 402 attempt has forwarded no events and can be retried as if it never
- * happened. Every other failure is passed through.
+ * Drive one request, retrying on a different key when its final HTTP attempt fails with a 402.
+ * The adapter reports that response before forwarding any stream events.
  */
-function rotatedAttempt(
-	keys: readonly string[],
+function rotatedAttempt<T extends StreamOptions>(
+	options: T | undefined,
 	keyring: Keyring,
-	produce: (apiKey: string, observeStatus: (status: number) => void) => AssistantMessageEventStream,
+	produce: (options: T | undefined) => AssistantMessageEventStream,
 ): AssistantMessageEventStream {
-	const out = createAssistantMessageEventStream();
+	if (authorizedOutsideKey(options)) return produce(options);
 
+	const out = createAssistantMessageEventStream();
+	const keys = candidateKeys(options?.apiKey, options?.env);
 	const first = keyring.select(keys);
 	if (!first) {
 		// Pi only calls a provider with a resolved key; keep the failure explicit if that changes.
@@ -309,16 +308,26 @@ function rotatedAttempt(
 		return out;
 	}
 
+	const fetch = options?.fetch ?? globalThis.fetch;
 	void (async () => {
 		let index = keys.indexOf(first);
 		for (;;) {
 			const key = keys[index]!;
-			// The last status wins: the adapter's own retries (429, 5xx) report one status per attempt.
-			const response: { status?: number } = {};
+			let lastStatus: number | undefined;
 			let attempt: AssistantMessageEventStream;
 			try {
-				attempt = produce(key, (status) => {
-					response.status = status;
+				attempt = produce({
+					...withApiKey(options, key),
+					fetch: (input, init) => {
+						// A transport failure on Pi's retry has no onResponse callback.
+						lastStatus = undefined;
+						return fetch(input, init);
+					},
+					onResponse: async (response, model) => {
+						const { status } = response;
+						await options?.onResponse?.(response, model);
+						lastStatus = status;
+					},
 				});
 			} catch (thrown) {
 				out.push(errorEvent(thrown instanceof Error ? thrown.message : String(thrown)));
@@ -326,7 +335,7 @@ function rotatedAttempt(
 				return;
 			}
 
-			let failure: AssistantMessageEvent | undefined;
+			let failure: StreamErrorEvent | undefined;
 			let terminal = false;
 			try {
 				for await (const event of attempt) {
@@ -351,14 +360,14 @@ function rotatedAttempt(
 			}
 
 			if (failure) {
-				const balanceFailure = response.status === PAYMENT_REQUIRED;
-				const next = balanceFailure ? keyring.rotate(keys, key) : undefined;
-				if (next) {
-					index = keys.indexOf(next);
-					continue;
+				if (lastStatus === PAYMENT_REQUIRED && failure.reason === "error" && !options?.signal?.aborted) {
+					const next = keyring.rotate(keys, key);
+					if (next) {
+						index = keys.indexOf(next);
+						continue;
+					}
+					keyring.reset();
 				}
-				// Every candidate failed: let the next request try the primary key again.
-				if (balanceFailure && !next) keyring.reset();
 				out.push(failure);
 				out.end();
 				return;
@@ -404,42 +413,13 @@ function withApiKey<T extends StreamOptions>(options: T | undefined, apiKey: str
 	return { ...options, apiKey, headers: switched } as T;
 }
 
-/**
- * Options for one attempt on `apiKey` that report each HTTP status to `observeStatus`, then to the
- * caller's `onResponse`, so pi still sees every attempt's response, including a rotated-away 402.
- */
-function attemptOptions<T extends StreamOptions>(
-	options: T | undefined,
-	apiKey: string,
-	observeStatus: (status: number) => void,
-): T {
-	const callerOnResponse = options?.onResponse;
-	return {
-		...withApiKey(options, apiKey),
-		onResponse: async (response: ProviderResponse, model: Model<Api>) => {
-			observeStatus(response.status);
-			await callerOnResponse?.(response, model);
-		},
-	} as T;
-}
-
 /** Wrap a provider's streams so an HTTP 402 on one key transparently retries the next key. */
 export function withKeyRotation(api: ProviderStreams, keyring: Keyring = new Keyring()): ProviderStreams {
 	return {
 		...api,
-		stream: (model, context, options) => {
-			if (authorizedOutsideKey(options)) return api.stream(model, context, options);
-			const keys = candidateKeys(options?.apiKey, options?.env);
-			return rotatedAttempt(keys, keyring, (apiKey, observeStatus) =>
-				api.stream(model, context, attemptOptions(options, apiKey, observeStatus)),
-			);
-		},
-		streamSimple: (model, context, options) => {
-			if (authorizedOutsideKey(options)) return api.streamSimple(model, context, options);
-			const keys = candidateKeys(options?.apiKey, options?.env);
-			return rotatedAttempt(keys, keyring, (apiKey, observeStatus) =>
-				api.streamSimple(model, context, attemptOptions(options, apiKey, observeStatus)),
-			);
-		},
+		stream: (model, context, options) =>
+			rotatedAttempt(options, keyring, (attempt) => api.stream(model, context, attempt)),
+		streamSimple: (model, context, options) =>
+			rotatedAttempt(options, keyring, (attempt) => api.streamSimple(model, context, attempt)),
 	};
 }
