@@ -30,6 +30,7 @@ import { dirname, join } from "node:path";
 import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
 	ApiKeyAuth,
+	ApiKeyCredential,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ProviderEnv,
@@ -94,52 +95,68 @@ export function nextFallbackIndex(env: ProviderEnv | undefined): number {
 	return index;
 }
 
-const UNVERIFIED_STORE = "Pi could not verify that the active credential store is empty for Venice. Login stopped.";
+const UNVERIFIED_STORE = "Pi could not verify the Venice entry in the active credential store. Login stopped.";
 
-/** Pi persists the login result as a replacement. Only the host's store sees the raw current credential. */
+/** What a login check saw of the active store's Venice entry, through this login's own resolve. */
+interface LoginCheck {
+	observed: boolean;
+	stored?: ApiKeyCredential;
+}
+
+/**
+ * Pi persists the login result as a replacement. Only the host's store sees the raw current
+ * credential, so login refuses to replace one that works. A stored key that does not resolve (a
+ * failing `!command` or an unset `$VAR`) can be entered again: its `env`, which holds the fallback
+ * keys, is copied onto the new credential.
+ */
 export function veniceApiKeyAuth(getRegistry: () => ModelRegistry | undefined): ApiKeyAuth {
 	const base = envApiKeyAuth("Venice API key", ["VENICE_API_KEY"]);
-	const loginCheck = new AsyncLocalStorage<{ empty: boolean }>();
+	const loginCheck = new AsyncLocalStorage<LoginCheck>();
 
-	async function checkFirstLogin(registry: ModelRegistry): Promise<void> {
-		const check = { empty: false };
-		const { source } = registry.getProviderAuthStatus("venice");
-		// A runtime override can hide a stored entry. A negative status is only a snapshot.
-		if (source !== "stored" && source !== "runtime") {
+	/** The env of the stored entry that login replaces, or undefined when nothing is stored. */
+	async function replaceableEnv(registry: ModelRegistry): Promise<ProviderEnv | undefined> {
+		const check: LoginCheck = { observed: false };
+		// A runtime override hides the stored entry from resolution. Any other status is only a snapshot.
+		if (registry.getProviderAuthStatus("venice").source !== "runtime") {
 			await loginCheck.run(check, () => registry.getProviderAuth("venice"));
 		}
-		if (!check.empty) {
+		if (!check.observed || check.stored?.key) {
 			throw new Error(
 				"Login can only set the first Venice key. To add a fallback, set the next unused VENICE_API_KEY_N (starting at 2) in the environment or in the active Venice credential's env.",
 			);
 		}
+		// A stored entry without a key also falls back to VENICE_API_KEY, so the environment decides there too.
 		if (process.env.VENICE_API_KEY) {
 			const name = `${FALLBACK_KEY_PREFIX}${nextFallbackIndex(undefined)}`;
 			throw new Error(
 				`VENICE_API_KEY is set, so Venice is configured from the environment and a stored key would override it. Add a fallback with: export ${name}=<key>`,
 			);
 		}
+		return check.stored?.env;
 	}
 
 	return {
 		...base,
 		resolve(input) {
-			// An entry with an unresolved $VAR or !command still has a credential object.
-			// Observe only its presence, scoped to this login's own registry request.
+			// The store hands over the entry with its key resolved: undefined when a $VAR or !command
+			// does not resolve, while its env stays as written. Observed only for this login's request.
 			const check = loginCheck.getStore();
-			if (check) check.empty = input.credential === undefined;
+			if (check) {
+				check.observed = true;
+				check.stored = input.credential;
+			}
 			return base.resolve(input);
 		},
 		login: async (interaction) => {
 			const registry = getRegistry();
 			if (!registry) throw new Error(UNVERIFIED_STORE);
-			await checkFirstLogin(registry);
+			await replaceableEnv(registry);
 			const credential = await base.login!(interaction);
-			// Another process can add a credential while the prompt is open.
-			await checkFirstLogin(registry);
+			// Another process can change the entry while the prompt is open. Keep the env it has now.
+			const env = await replaceableEnv(registry);
 			interaction.signal.throwIfAborted();
 			if (registry !== getRegistry()) throw new Error(UNVERIFIED_STORE);
-			return credential;
+			return env ? { ...credential, env } : credential;
 		},
 	};
 }

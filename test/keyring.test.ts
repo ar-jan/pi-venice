@@ -517,11 +517,52 @@ describe("Venice login through Pi's credential store", () => {
 		assert.deepEqual(readFileSync(defaultAuthPath), beforeA);
 	});
 
-	it("checks for an entry added while the prompt is open, even if its primary cannot resolve", async (t) => {
+	for (const key of ["!false", "$PV_TEST_UNSET_KEY"]) {
+		it(`re-enters a stored ${key[0]} key that does not resolve and keeps its fallbacks`, async (t) => {
+			const env = { ...a.env, VENICE_API_KEY_4: "a-4", PV_TEST_OTHER: "kept" };
+			writeFileSync(defaultAuthPath, JSON.stringify({ venice: { type: "api_key", key, env } }));
+			const runtime = await veniceRuntime(t);
+			assert.equal(await runtime.getAuth("venice"), undefined);
+
+			await runtime.login("venice", "api_key", interaction("new-key"));
+
+			assert.deepEqual(JSON.parse(readFileSync(defaultAuthPath, "utf8")), {
+				venice: { type: "api_key", key: "new-key", env },
+			});
+			assert.equal(runtime.getProviderAuthStatus("venice").configured, true);
+			const auth = await runtime.getAuth("venice");
+			assert.deepEqual(candidateKeys(auth?.auth.apiKey, auth?.env), ["new-key", "a-2", "a-4"]);
+		});
+	}
+
+	it("re-enters a stored key that does not resolve and has no env as just the new key", async (t) => {
+		writeFileSync(defaultAuthPath, JSON.stringify({ venice: { type: "api_key", key: "!false" } }));
+		const runtime = await veniceRuntime(t);
+
+		await runtime.login("venice", "api_key", interaction("new-key"));
+
+		assert.deepEqual(JSON.parse(readFileSync(defaultAuthPath, "utf8")), {
+			venice: { type: "api_key", key: "new-key" },
+		});
+	});
+
+	it("keeps an environment-configured user's stored key that does not resolve", async (t) => {
+		const contents = JSON.stringify({ venice: { type: "api_key", key: "!false", env: a.env } });
+		writeFileSync(defaultAuthPath, contents);
+		process.env.VENICE_API_KEY = "env-primary";
+		const runtime = await veniceRuntime(t);
+		// Without a stored key, Pi resolves VENICE_API_KEY, which a new stored key would override.
+		assert.equal((await runtime.getAuth("venice"))?.auth.apiKey, "env-primary");
+
+		await assert.rejects(runtime.login("venice", "api_key", interaction()), /export VENICE_API_KEY_2=<key>/);
+		assert.equal(readFileSync(defaultAuthPath, "utf8"), contents);
+	});
+
+	it("checks for a working entry added while the prompt is open", async (t) => {
 		const alternate = profile();
 		const alternatePath = join(alternate, "auth.json");
 		const runtime = await veniceRuntime(t, alternate);
-		const contents = JSON.stringify({ venice: { type: "api_key", key: "$PV_TEST_UNSET_KEY", env: b.env } });
+		const contents = JSON.stringify({ venice: { type: "api_key", key: "!echo b-1", env: b.env } });
 		await assert.rejects(runtime.login("venice", "api_key", {
 			...interaction(),
 			prompt: async () => {
@@ -530,6 +571,36 @@ describe("Venice login through Pi's credential store", () => {
 			},
 		}), /add a fallback/);
 		assert.equal(readFileSync(alternatePath, "utf8"), contents);
+	});
+
+	it("keeps the fallbacks of an entry added while the prompt is open whose primary cannot resolve", async (t) => {
+		const alternate = profile();
+		const alternatePath = join(alternate, "auth.json");
+		const runtime = await veniceRuntime(t, alternate);
+		await runtime.login("venice", "api_key", {
+			...interaction(),
+			prompt: async () => {
+				writeFileSync(alternatePath, JSON.stringify({ venice: { type: "api_key", key: "$PV_TEST_UNSET_KEY", env: b.env } }));
+				return "new-key";
+			},
+		});
+		assert.deepEqual(JSON.parse(readFileSync(alternatePath, "utf8")), {
+			venice: { type: "api_key", key: "new-key", env: b.env },
+		});
+	});
+
+	it("stops when a stored key that did not resolve is fixed while the prompt is open", async (t) => {
+		writeFileSync(defaultAuthPath, JSON.stringify({ venice: { type: "api_key", key: "!false", env: a.env } }));
+		const runtime = await veniceRuntime(t);
+		const contents = JSON.stringify({ venice: { type: "api_key", key: "fixed-key", env: a.env } });
+		await assert.rejects(runtime.login("venice", "api_key", {
+			...interaction(),
+			prompt: async () => {
+				writeFileSync(defaultAuthPath, contents);
+				return "new-key";
+			},
+		}), /add a fallback/);
+		assert.equal(readFileSync(defaultAuthPath, "utf8"), contents);
 	});
 
 	it("stops when the active store fails during the login check", async (t) => {

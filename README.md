@@ -18,13 +18,17 @@ Run `/login venice` to save a primary key in Pi's active credential store, or se
 
 A second (or third) key can take over when the current key runs out of credits.
 
-**Stored credential.** Once the active store has a Venice credential, repeat login stops. Pi's
-login hook receives no raw credential to append to. To add a fallback, use the first unused
-`VENICE_API_KEY_N` starting at 2 across the environment and the active Venice credential's `env`.
-For file-backed profiles, edit that profile's `auth.json`. SDK hosts with an injected store can
-edit the Venice entry in that store. Keep the primary key (including any `$VAR` or `!command`
-reference) and existing fallback numbers as written. To replace the whole credential, run
-`/logout venice` and log in again. Logging out also removes its stored fallbacks.
+**Stored credential.** Once the active store has a Venice credential whose key resolves, repeat
+login stops. Pi's login hook receives no raw credential to append to. To add a fallback, use the
+first unused `VENICE_API_KEY_N` starting at 2 across the environment and the active Venice
+credential's `env`. For file-backed profiles, edit that profile's `auth.json`. SDK hosts with an
+injected store can edit the Venice entry in that store. Keep the primary key (including any `$VAR`
+or `!command` reference) and existing fallback numbers as written. To replace the whole
+credential, run `/logout venice` and log in again. Logging out also removes its stored fallbacks.
+
+A stored key that does not resolve, such as a `!command` that fails or an unset `$VAR`, can be
+entered again with `/login venice` (Pi's `/login` marks it `stored key did not resolve`). The new
+key replaces only the primary: the credential's `env`, with its fallbacks, is kept.
 
 **Environment.** If the primary key comes from `VENICE_API_KEY`, `/login venice` explains which
 variable to export instead, because a stored key would override the environment. Add fallbacks with
