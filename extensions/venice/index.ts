@@ -6,6 +6,10 @@
  * - Models: fetched from Venice's live catalog (`GET /models?type=text`), limited to models that
  *   support tool calling, and cached in models-store.json for offline use. E2EE-capable models are
  *   included and run in TEE-only mode: requests reach Venice as plaintext (see toPiModel).
+ * - Decision models (`GET /models?type=decision`, e.g. `jev-latest`, `clef-api`) are registered as
+ *   Pi `classifier` models using Pi's built-in TypeSafe System One client (`POST /systemone`),
+ *   available through codemode `models.classify` and `ctx.modelRegistry.classify`. They do not appear
+ *   in `/model`, and Venice accepts PNG/JPEG images only (no WebP) for them.
  * - Every model name is marked "(private)" or "(anonymized)" after Venice's privacy tier, plus
  *   "TEE" for models that run in an attested enclave.
  * - Requests disable Venice's own system prompt, carry a per-session `prompt_cache_key`, turn
@@ -20,10 +24,13 @@
 import {
 	type Api,
 	clampThinkingLevel,
+	type ClassifierModel,
 	createProvider,
+	isModelType,
 	type Model,
 	type ProviderStreams,
 	type RefreshModelsContext,
+	type SystemOneCompat,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 // Pi's extension loader maps only a fixed set of pi-ai specifiers onto the host
@@ -33,6 +40,7 @@ import {
 // stable entry point for API implementations.
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { borrowedSystemOne } from "./classify.ts";
 import {
 	candidateKeys,
 	describeKeys,
@@ -41,6 +49,7 @@ import {
 	loadPreferredKeyHash,
 	savePreferredKeyHash,
 	veniceApiKeyAuth,
+	withClassifierKeyRotation,
 	withKeyRotation,
 } from "./keyring.ts";
 import { registerProviderWithRefreshCommand } from "./refresh.ts";
@@ -67,6 +76,8 @@ interface VeniceModel {
 		offline?: boolean;
 		availableContextTokens?: number;
 		maxCompletionTokens?: number;
+		maxStateTokens?: number;
+		maxTotalTokens?: number;
 		deprecation?: { date?: string; removesAt?: string } | null;
 		capabilities?: {
 			supportsFunctionCalling?: boolean;
@@ -101,6 +112,7 @@ const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
+const DEFAULT_DECISION_CONTEXT_WINDOW = 32_768;
 
 // Catalogs sometimes publish an output cap equal to (or above) the context window when the real cap
 // is unknown. Taken at face value it asks for the whole window as output and leaves nothing for
@@ -213,6 +225,38 @@ function usd(price: VenicePrice | undefined): number {
 	return typeof price?.usd === "number" ? price.usd : 0;
 }
 
+function modelTags(spec: NonNullable<VeniceModel["model_spec"]>, removesAt: string | undefined): string[] {
+	const privacy = spec.privacy === "private" ? "private" : "anonymized";
+	const tags: string[] = [privacy];
+	if (spec.capabilities?.supportsTeeAttestation) tags.push("TEE");
+	if (removesAt) tags.push(`deprecated ${removesAt.slice(0, 10)}`);
+	return tags;
+}
+
+function modelCost(pricing: NonNullable<VeniceModel["model_spec"]>["pricing"]): Model<"openai-completions">["cost"] {
+	const rates = pricing ?? {};
+	const extended = rates.extended;
+	return {
+		input: usd(rates.input),
+		output: usd(rates.output),
+		cacheRead: usd(rates.cache_input),
+		cacheWrite: usd(rates.cache_write),
+		...(extended?.context_token_threshold
+			? {
+					tiers: [
+						{
+							inputTokensAbove: extended.context_token_threshold,
+							input: usd(extended.input ?? rates.input),
+							output: usd(extended.output ?? rates.output),
+							cacheRead: usd(extended.cache_input ?? rates.cache_input),
+							cacheWrite: usd(extended.cache_write ?? rates.cache_write),
+						},
+					],
+				}
+			: {}),
+	};
+}
+
 export function toPiModel(model: VeniceModel): Model<"openai-completions"> | undefined {
 	const spec = model.model_spec;
 	const caps = spec?.capabilities;
@@ -230,13 +274,8 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 	const removesAt = spec.deprecation?.removesAt ?? spec.deprecation?.date;
 	if (removesAt && Date.parse(removesAt) <= now) return undefined;
 
-	const privacy = spec.privacy === "private" ? "private" : "anonymized";
-	const tags: string[] = [privacy];
-	if (caps.supportsTeeAttestation) tags.push("TEE");
-	if (removesAt) tags.push(`deprecated ${removesAt.slice(0, 10)}`);
-
+	const tags = modelTags(spec, removesAt);
 	const pricing = spec.pricing ?? {};
-	const extended = pricing.extended;
 	const thinking = thinkingConfig(model);
 	const { contextWindow, maxTokens } = modelLimits(spec);
 	const vision = caps.supportsVision === true;
@@ -259,25 +298,7 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 					},
 				}
 			: {}),
-		cost: {
-			input: usd(pricing.input),
-			output: usd(pricing.output),
-			cacheRead: usd(pricing.cache_input),
-			cacheWrite: usd(pricing.cache_write),
-			...(extended?.context_token_threshold
-				? {
-						tiers: [
-							{
-								inputTokensAbove: extended.context_token_threshold,
-								input: usd(extended.input ?? pricing.input),
-								output: usd(extended.output ?? pricing.output),
-								cacheRead: usd(extended.cache_input ?? pricing.cache_input),
-								cacheWrite: usd(extended.cache_write ?? pricing.cache_write),
-							},
-						],
-					}
-				: {}),
-		},
+		cost: modelCost(pricing),
 		reasoning: thinking.reasoning,
 		...(thinking.thinkingLevelMap ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
 		...(pricing.cache_input ? { promptCache: { short: 300 } } : {}),
@@ -298,24 +319,107 @@ export function toPiModel(model: VeniceModel): Model<"openai-completions"> | und
 	};
 }
 
-async function fetchVeniceModels({
-	baseUrl = BASE_URL,
-	credential,
-	signal,
-}: RefreshModelsContext): Promise<Model<"openai-completions">[]> {
-	const headers: Record<string, string> = { accept: "application/json" };
-	if (credential?.type === "api_key" && credential.key) headers.authorization = `Bearer ${credential.key}`;
-	const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/models?type=text`, {
+/**
+ * Map a Venice decision catalog entry (`GET /models?type=decision`) to a Pi classifier model.
+ *
+ * Venice exposes System One at `POST /api/v1/systemone` (alias of `/decisions`). `compat` is
+ * always set explicitly so TypeSafe's defaults (`assets` + `TypeSafe-Danger-Zone-Images: true`)
+ * never leak onto Venice: Jev uses `assets` and every other decision model (e.g. `clef-api`) uses
+ * `images`, both without the opt-in header.
+ */
+export function toPiClassifierModel(model: VeniceModel): ClassifierModel<"typesafe-system-one"> | undefined {
+	const spec = model.model_spec;
+	if (!spec) return undefined;
+	if (model.type !== undefined && model.type !== "decision") return undefined;
+	if (spec.offline) return undefined;
+
+	const now = Date.now();
+	const removesAt = spec.deprecation?.removesAt ?? spec.deprecation?.date;
+	if (removesAt && Date.parse(removesAt) <= now) return undefined;
+
+	const tags = modelTags(spec, removesAt);
+	const contextWindow =
+		spec.maxTotalTokens && spec.maxTotalTokens > 0
+			? spec.maxTotalTokens
+			: spec.maxStateTokens && spec.maxStateTokens > 0
+				? spec.maxStateTokens
+				: spec.availableContextTokens && spec.availableContextTokens > 0
+					? spec.availableContextTokens
+					: DEFAULT_DECISION_CONTEXT_WINDOW;
+	// Live decision entries omit `capabilities` while Venice's swagger documents image input for
+	// both current models (`jev-latest` and `clef-api`); honor an explicit `supportsVision: false`.
+	const vision = spec.capabilities?.supportsVision !== false;
+	const compat: SystemOneCompat = {
+		imageInput: model.id.startsWith("jev") ? "assets" : "images",
+		sendImageOptInHeader: false,
+	};
+
+	return {
+		type: "classifier",
+		id: model.id,
+		name: `${spec.name ?? model.id} (${tags.join(", ")})`,
+		api: "typesafe-system-one",
+		provider: PROVIDER_ID,
+		baseUrl: BASE_URL,
+		input: vision ? ["text", "image"] : ["text"],
+		cost: modelCost(spec.pricing),
+		contextWindow,
+		compat,
+	};
+}
+
+async function fetchModelList(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<VeniceModel[]> {
+	const response = await fetch(url, {
 		headers,
 		signal: AbortSignal.any([signal, AbortSignal.timeout(MODELS_TIMEOUT_MS)]),
 	});
 	if (!response.ok) throw new Error(`Venice model list request failed: ${response.status}`);
 	const body = (await response.json()) as { data?: unknown };
 	if (!Array.isArray(body.data)) throw new Error("Invalid Venice model list response");
-	return (body.data as VeniceModel[])
-		.map(toPiModel)
-		.filter((model): model is Model<"openai-completions"> => model !== undefined)
-		.sort((a, b) => a.name.localeCompare(b.name));
+	return body.data as VeniceModel[];
+}
+
+function cachedClassifiers(stored: RefreshModelsContext["stored"]): ClassifierModel<"typesafe-system-one">[] {
+	return (stored?.models ?? []).filter(
+		(model): model is ClassifierModel<"typesafe-system-one"> =>
+			model.provider === PROVIDER_ID && isModelType(model, "classifier"),
+	);
+}
+
+async function fetchVeniceModels(
+	{ baseUrl = BASE_URL, credential, signal, stored }: RefreshModelsContext,
+	includeDecisions: boolean,
+): Promise<(Model<"openai-completions"> | ClassifierModel<"typesafe-system-one">)[]> {
+	const headers: Record<string, string> = { accept: "application/json" };
+	if (credential?.type === "api_key" && credential.key) headers.authorization = `Bearer ${credential.key}`;
+	const root = baseUrl.replace(/\/+$/, "");
+
+	const textPromise = fetchModelList(`${root}/models?type=text`, headers, signal).then((entries) =>
+		entries
+			.map(toPiModel)
+			.filter((model): model is Model<"openai-completions"> => model !== undefined)
+			.sort((a, b) => a.name.localeCompare(b.name)),
+	);
+	if (!includeDecisions) return textPromise;
+
+	// Decision models are beta: a failing decision-list request must not fail the text catalog
+	// refresh. Because `createProvider` replaces the whole persisted catalog with `fetchModels`'s
+	// return value, keep previously cached classifiers on transient failures rather than wiping
+	// them out of `models-store.json`.
+	const decisionPromise = fetchModelList(`${root}/models?type=decision`, headers, signal)
+		.then((entries) =>
+			entries
+				.map(toPiClassifierModel)
+				.filter((model): model is ClassifierModel<"typesafe-system-one"> => model !== undefined)
+				.sort((a, b) => a.name.localeCompare(b.name)),
+		)
+		.catch((error) => {
+			if (signal.aborted) throw error;
+			return cachedClassifiers(stored);
+		});
+
+	const [chatModels, decisionModels] = await Promise.all([textPromise, decisionPromise]);
+	return [...chatModels, ...decisionModels];
 }
 
 // =============================================================================
@@ -332,6 +436,7 @@ export function veniceApi(keyring: Keyring): ProviderStreams {
 
 export default function (pi: ExtensionAPI) {
 	const keyring = new Keyring(loadPreferredKeyHash());
+	const systemOne = borrowedSystemOne();
 
 	// The registry belongs to the active session, which can change on reload or session replacement.
 	let registry: ExtensionContext["modelRegistry"] | undefined;
@@ -350,8 +455,14 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: BASE_URL,
 			auth: { apiKey: veniceApiKeyAuth(() => registry) },
 			models: [],
-			fetchModels: fetchVeniceModels,
+			fetchModels: (context) => fetchVeniceModels(context, systemOne !== undefined),
+			...(systemOne
+				? {}
+				: { filterAllModels: (models) => models.filter((model) => !isModelType(model, "classifier")) }),
 			api: veniceApi(keyring),
+			...(systemOne
+				? { classifiers: { "typesafe-system-one": withClassifierKeyRotation(systemOne, keyring) } }
+				: {}),
 		}),
 	);
 

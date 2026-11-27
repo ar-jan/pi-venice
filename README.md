@@ -122,7 +122,8 @@ For a Venice-compatible gateway, set `providers.venice.baseUrl` in `~/.pi/agent/
 }
 ```
 
-Pi uses that base URL for chat, and catalog discovery requests `/models?type=text` under the same URL.
+Pi uses that base URL for chat and decision requests, and catalog discovery requests
+`/models?type=text` and `/models?type=decision` under the same URL.
 
 ## Features
 
@@ -130,6 +131,9 @@ Pi uses that base URL for chat, and catalog discovery requests `/models?type=tex
   support tool calling, and cached in `models-store.json`; `/venice-refresh-models` refetches it on
   demand (see [Model catalog](#model-catalog)). Venice's E2EE-capable models are included and run in
   TEE-only mode (see [TEE models](#tee-models)).
+- Decision models (`GET /models?type=decision`, e.g. `jev-latest`, `clef-api`) are registered as Pi
+  `classifier` models for codemode `models.classify` and `ctx.modelRegistry.classify` (see
+  [Decision models](#decision-models)).
 - One catalog model is left out because its tool calling fails on every request:
   `e2ee-qwen3-vl-30b-a3b-p` (see [TEE models](#tee-models)).
 - Contradictory catalog limits (max output at or above the context window) are clamped so an
@@ -159,6 +163,20 @@ Pi uses that base URL for chat, and catalog discovery requests `/models?type=tex
 - Thinking can be turned off (`off`) where Venice lists a `"none"` effort, and additionally on short
   lists of models verified to honor `venice_parameters.disable_thinking` or an unlisted `"none"`
   (see [Thinking](#thinking)).
+
+## Decision models
+
+Venice's decision models (`jev-latest`, `clef-api`) are discovered from `GET /models?type=decision`
+and registered as Pi `classifier` models using Venice's `POST /systemone` endpoint. Like other
+decision models in Pi, they do not appear in `/model`; call them through codemode
+`models.classify()` or from extensions via `ctx.modelRegistry.classify()`.
+
+Key rotation on HTTP 402 applies to decision requests the same way it does to chat requests.
+
+Venice accepts PNG and JPEG images only (no WebP) for decision models: `jev-latest` takes images as
+System One `assets`, while `clef-api` and other decision models take them in `images` (up to 4).
+Decision models are beta on Venice; if the decision catalog request fails during a refresh, chat
+models still refresh normally and previously cached decision models stay in place.
 
 ## Images
 

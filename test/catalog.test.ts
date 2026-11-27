@@ -3,9 +3,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { getSupportedThinkingLevels, InMemoryCredentialStore, type Provider } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, InMemoryCredentialStore, InMemoryModelsStore, type Provider } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import registerVenice, { toPiModel } from "../extensions/venice/index.ts";
+import registerVenice, { toPiClassifierModel, toPiModel } from "../extensions/venice/index.ts";
 
 type Capabilities = Record<string, unknown>;
 
@@ -24,6 +24,26 @@ function veniceModel(
 			maxCompletionTokens: limits.maxTokens ?? 16_384,
 			capabilities: { supportsFunctionCalling: true, ...capabilities },
 			pricing: { input: { usd: 1 }, output: { usd: 2 } },
+		},
+	};
+}
+
+function veniceDecisionModel(
+	id = "jev-latest",
+	overrides: Record<string, unknown> = {},
+	type: string | undefined = "decision",
+) {
+	return {
+		id,
+		...(type === undefined ? {} : { type }),
+		model_spec: {
+			name: id === "jev-latest" ? "Jev (System One)" : "Clef (System One)",
+			privacy: id === "jev-latest" ? "anonymized" : "private",
+			offline: false,
+			maxStateTokens: 32_000,
+			maxTotalTokens: id === "jev-latest" ? 64_000 : 32_768,
+			pricing: { input: { usd: 0.042 }, output: { usd: 0 } },
+			...overrides,
 		},
 	};
 }
@@ -50,16 +70,139 @@ describe("catalog refresh", () => {
 		} as never);
 		// Let the cache-only refresh triggered by registration finish before refreshing over the network.
 		await refresh.mock.calls[0]?.result;
-		const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [veniceModel()] }));
+		const fetch = t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.includes("type=decision")) return Response.json({ data: [veniceDecisionModel("jev-latest")] });
+			return Response.json({ data: [veniceModel()] });
+		});
 
 		const result = await registry.refresh({ providers: ["venice"], allowNetwork: true });
 
 		assert.equal(result.errors.size, 0);
-		assert.equal(fetch.mock.callCount(), 1);
-		const [url, options] = fetch.mock.calls[0]!.arguments;
-		assert.equal(String(url), "https://gateway.example/venice/v1/models?type=text");
-		assert.equal(new Headers(options?.headers).get("authorization"), "Bearer gateway-key");
+		assert.equal(fetch.mock.callCount(), 2);
+		const urls = fetch.mock.calls.map((call) => String(call.arguments[0])).sort();
+		assert.deepEqual(urls, [
+			"https://gateway.example/venice/v1/models?type=decision",
+			"https://gateway.example/venice/v1/models?type=text",
+		]);
+		for (const call of fetch.mock.calls) {
+			assert.equal(new Headers(call.arguments[1]?.headers).get("authorization"), "Bearer gateway-key");
+		}
 		assert.equal(registry.find("venice", "grok-4-20")?.baseUrl, baseUrl);
+		assert.equal(registry.findOfType("classifier", "venice", "jev-latest")?.baseUrl, baseUrl);
+	});
+
+	it("keeps chat models refreshing and preserves cached classifiers when the decision list fails", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const modelsStore = new InMemoryModelsStore();
+		const cachedDecision = toPiClassifierModel(veniceDecisionModel("jev-latest") as never)!;
+		await modelsStore.write("venice", { models: [cachedDecision], checkedAt: 1 });
+		const runtime = await ModelRuntime.create({ credentials, modelsStore, modelsPath: null });
+		const registry = new ModelRegistry(runtime);
+		const refresh = t.mock.method(runtime, "refresh");
+		registerVenice({
+			on() {},
+			registerCommand() {},
+			registerProvider(provider: Provider) {
+				registry.registerProvider(provider);
+			},
+		} as never);
+		await refresh.mock.calls[0]?.result;
+
+		t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+			if (String(input).includes("type=decision")) return new Response("unavailable", { status: 503 });
+			return Response.json({ data: [veniceModel()] });
+		});
+
+		const result = await registry.refresh({ providers: ["venice"], allowNetwork: true });
+
+		assert.equal(result.errors.size, 0);
+		assert.equal(registry.find("venice", "grok-4-20")?.id, "grok-4-20");
+		assert.equal(registry.findOfType("classifier", "venice", "jev-latest")?.id, "jev-latest");
+	});
+
+	it("still loads chat models when the decision list fails with an empty cache", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const runtime = await ModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore(), modelsPath: null });
+		const registry = new ModelRegistry(runtime);
+		const refresh = t.mock.method(runtime, "refresh");
+		registerVenice({
+			on() {},
+			registerCommand() {},
+			registerProvider(provider: Provider) {
+				registry.registerProvider(provider);
+			},
+		} as never);
+		await refresh.mock.calls[0]?.result;
+
+		t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+			if (String(input).includes("type=decision")) throw new Error("network down");
+			return Response.json({ data: [veniceModel()] });
+		});
+
+		const result = await registry.refresh({ providers: ["venice"], allowNetwork: true });
+
+		assert.equal(result.errors.size, 0);
+		assert.equal(registry.find("venice", "grok-4-20")?.id, "grok-4-20");
+		assert.deepEqual(registry.getModelsOfType("classifier", "venice"), []);
+	});
+});
+
+describe("toPiClassifierModel", () => {
+	it("maps jev models to assets compat without the opt-in header", () => {
+		const model = toPiClassifierModel(veniceDecisionModel("jev-latest") as never);
+		assert.deepEqual(model, {
+			type: "classifier",
+			id: "jev-latest",
+			name: "Jev (System One) (anonymized)",
+			api: "typesafe-system-one",
+			provider: "venice",
+			baseUrl: "https://api.venice.ai/api/v1",
+			input: ["text", "image"],
+			cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 64_000,
+			compat: { imageInput: "assets", sendImageOptInHeader: false },
+		});
+	});
+
+	it("maps clef and other decision models to images compat without the opt-in header", () => {
+		const model = toPiClassifierModel(
+			veniceDecisionModel("clef-api", {
+				pricing: { input: { usd: 0.05 }, output: { usd: 0.05 } },
+			}) as never,
+		);
+		assert.deepEqual(model, {
+			type: "classifier",
+			id: "clef-api",
+			name: "Clef (System One) (private)",
+			api: "typesafe-system-one",
+			provider: "venice",
+			baseUrl: "https://api.venice.ai/api/v1",
+			input: ["text", "image"],
+			cost: { input: 0.05, output: 0.05, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 32_768,
+			compat: { imageInput: "images", sendImageOptInHeader: false },
+		});
+	});
+
+	it("honors explicit supportsVision: false in capabilities", () => {
+		const model = toPiClassifierModel(
+			veniceDecisionModel("clef-text-only", { capabilities: { supportsVision: false } }) as never,
+		);
+		assert.deepEqual(model?.input, ["text"]);
+	});
+
+	it("skips offline, removed, and non-decision entries", () => {
+		assert.equal(toPiClassifierModel(veniceDecisionModel("jev-latest", { offline: true }) as never), undefined);
+		assert.equal(
+			toPiClassifierModel(
+				veniceDecisionModel("jev-latest", { deprecation: { removesAt: "2020-01-01T00:00:00Z" } }) as never,
+			),
+			undefined,
+		);
+		assert.equal(toPiClassifierModel(veniceDecisionModel("grok-4-20", {}, "text") as never), undefined);
 	});
 });
 

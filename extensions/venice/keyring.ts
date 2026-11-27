@@ -29,12 +29,20 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createAssistantMessageEventStream, envApiKeyAuth } from "@earendil-works/pi-ai";
 import type {
+	Api,
 	ApiKeyAuth,
 	ApiKeyCredential,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
+	ClassifierApi,
+	ClassifierModel,
+	ClassifierOptions,
+	ClassifierResult,
+	Model,
+	ProviderClassifier,
 	ProviderEnv,
 	ProviderHeaders,
+	ProviderRequestOptions,
 	ProviderStreams,
 	StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -305,6 +313,53 @@ function errorEvent(message: string): StreamErrorEvent {
 	};
 }
 
+interface TrackedAttempt<T> {
+	options: T;
+	lastStatus(): number | undefined;
+}
+
+type KeyedOptions = { apiKey?: string; headers?: ProviderHeaders };
+
+/** Build one attempt's options for `key`, tracking the HTTP status of its final completed response. */
+function trackedAttemptOptions<TModel, T extends ProviderRequestOptions<TModel>>(
+	options: T | undefined,
+	key: string,
+	baseFetch: typeof globalThis.fetch,
+): TrackedAttempt<T> {
+	let lastStatus: number | undefined;
+	return {
+		options: {
+			...withApiKey(options, key),
+			fetch: (input, init) => {
+				// A transport failure on Pi's retry has no onResponse callback.
+				lastStatus = undefined;
+				return baseFetch(input, init);
+			},
+			onResponse: async (response, model) => {
+				const { status } = response;
+				await options?.onResponse?.(response, model);
+				lastStatus = status;
+			},
+		} as T,
+		lastStatus: () => lastStatus,
+	};
+}
+
+/** Advance to the next candidate key after a 402 error, or reset when every key failed. */
+function nextKeyOnPaymentRequired(
+	keyring: Keyring,
+	keys: readonly string[],
+	key: string,
+	status: number | undefined,
+	isError: boolean,
+	signal: AbortSignal | undefined,
+): string | undefined {
+	if (status !== PAYMENT_REQUIRED || !isError || signal?.aborted) return undefined;
+	const next = keyring.rotate(keys, key);
+	if (!next) keyring.reset();
+	return next;
+}
+
 /**
  * Drive one request, retrying on a different key when its final HTTP attempt fails with a 402.
  * The adapter reports that response before forwarding any stream events.
@@ -326,27 +381,14 @@ function rotatedAttempt<T extends StreamOptions>(
 		return out;
 	}
 
-	const fetch = options?.fetch ?? globalThis.fetch;
+	const baseFetch = options?.fetch ?? globalThis.fetch;
 	void (async () => {
-		let index = keys.indexOf(first);
+		let key = first;
 		for (;;) {
-			const key = keys[index]!;
-			let lastStatus: number | undefined;
+			const tracked = trackedAttemptOptions<Model<Api>, T>(options, key, baseFetch);
 			let attempt: AssistantMessageEventStream;
 			try {
-				attempt = produce({
-					...withApiKey(options, key),
-					fetch: (input, init) => {
-						// A transport failure on Pi's retry has no onResponse callback.
-						lastStatus = undefined;
-						return fetch(input, init);
-					},
-					onResponse: async (response, model) => {
-						const { status } = response;
-						await options?.onResponse?.(response, model);
-						lastStatus = status;
-					},
-				});
+				attempt = produce(tracked.options);
 			} catch (thrown) {
 				out.push(errorEvent(thrown instanceof Error ? thrown.message : String(thrown)));
 				out.end();
@@ -378,13 +420,17 @@ function rotatedAttempt<T extends StreamOptions>(
 			}
 
 			if (failure) {
-				if (lastStatus === PAYMENT_REQUIRED && failure.reason === "error" && !options?.signal?.aborted) {
-					const next = keyring.rotate(keys, key);
-					if (next) {
-						index = keys.indexOf(next);
-						continue;
-					}
-					keyring.reset();
+				const next = nextKeyOnPaymentRequired(
+					keyring,
+					keys,
+					key,
+					tracked.lastStatus(),
+					failure.reason === "error",
+					options?.signal,
+				);
+				if (next) {
+					key = next;
+					continue;
 				}
 				out.push(failure);
 				out.end();
@@ -400,6 +446,18 @@ function rotatedAttempt<T extends StreamOptions>(
 	return out;
 }
 
+function classifierError(model: ClassifierModel<ClassifierApi>, message: string): ClassifierResult {
+	return {
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		answers: {},
+		stopReason: "error",
+		errorMessage: message,
+		timestamp: Date.now(),
+	};
+}
+
 function authorizationHeaders(headers: ProviderHeaders | undefined): [string, string | null][] {
 	return Object.entries(headers ?? {}).filter(([name]) => name.toLowerCase() === "authorization");
 }
@@ -412,12 +470,12 @@ function bearerToken(value: string | null): string | undefined {
  * Whether an `Authorization` header (or a `null` that suppresses it) decides the credential instead
  * of the resolved key. Switching `apiKey` would resend that same credential.
  */
-function authorizedOutsideKey(options: StreamOptions | undefined): boolean {
+function authorizedOutsideKey(options: KeyedOptions | undefined): boolean {
 	return authorizationHeaders(options?.headers).some(([, value]) => bearerToken(value) !== options?.apiKey);
 }
 
 /** Options that authenticate with `apiKey`, including a header Pi's `authHeader` built from the resolved key. */
-function withApiKey<T extends StreamOptions>(options: T | undefined, apiKey: string): T {
+function withApiKey<T extends KeyedOptions>(options: T | undefined, apiKey: string): T {
 	const headers = options?.headers;
 	if (!headers || apiKey === options?.apiKey || authorizationHeaders(headers).length === 0) {
 		return { ...options, apiKey } as T;
@@ -439,5 +497,50 @@ export function withKeyRotation(api: ProviderStreams, keyring: Keyring = new Key
 			rotatedAttempt(options, keyring, (attempt) => api.stream(model, context, attempt)),
 		streamSimple: (model, context, options) =>
 			rotatedAttempt(options, keyring, (attempt) => api.streamSimple(model, context, attempt)),
+	};
+}
+
+/** Wrap a classifier so an HTTP 402 on one key transparently retries the next key. */
+export function withClassifierKeyRotation(
+	classifier: ProviderClassifier,
+	keyring: Keyring = new Keyring(),
+): ProviderClassifier {
+	return {
+		classify: async (model, context, options) => {
+			if (authorizedOutsideKey(options)) return classifier.classify(model, context, options);
+
+			const keys = candidateKeys(options?.apiKey, options?.env);
+			const first = keyring.select(keys);
+			if (!first) return classifierError(model, "No Venice API key is configured");
+
+			const baseFetch = options?.fetch ?? globalThis.fetch;
+			let key = first;
+			for (;;) {
+				const tracked = trackedAttemptOptions<ClassifierModel<ClassifierApi>, ClassifierOptions>(
+					options,
+					key,
+					baseFetch,
+				);
+				let result: ClassifierResult;
+				try {
+					result = await classifier.classify(model, context, tracked.options);
+				} catch (thrown) {
+					return classifierError(model, thrown instanceof Error ? thrown.message : String(thrown));
+				}
+
+				if (result.stopReason === "stop") return result;
+
+				const next = nextKeyOnPaymentRequired(
+					keyring,
+					keys,
+					key,
+					tracked.lastStatus(),
+					result.stopReason === "error",
+					options?.signal,
+				);
+				if (!next) return result;
+				key = next;
+			}
+		},
 	};
 }

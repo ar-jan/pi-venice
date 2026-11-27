@@ -10,8 +10,12 @@ import type {
 	ApiKeyCredential,
 	AssistantMessage,
 	AssistantMessageEventStream,
+	ClassifierModel,
+	ClassifierOptions,
+	ClassifierResult,
 	Model,
 	ProviderAuthInteraction,
+	ProviderClassifier,
 	ProviderHeaders,
 	ProviderStreams,
 	SimpleStreamOptions,
@@ -26,6 +30,7 @@ import {
 	nextFallbackIndex,
 	savePreferredKeyHash,
 	veniceApiKeyAuth,
+	withClassifierKeyRotation,
 	withKeyRotation,
 } from "../extensions/venice/keyring.ts";
 
@@ -347,6 +352,164 @@ describe("withKeyRotation", () => {
 				assert.equal(result.stopReason, "error");
 			});
 		}
+	});
+});
+
+describe("withClassifierKeyRotation", () => {
+	const fallback = { VENICE_API_KEY_2: "key-2" };
+	const classifierModel: ClassifierModel<"typesafe-system-one"> = {
+		type: "classifier",
+		id: "jev-latest",
+		name: "Jev (System One) (anonymized)",
+		api: "typesafe-system-one",
+		provider: "venice",
+		baseUrl: "https://api.venice.ai/api/v1",
+		input: ["text", "image"],
+		cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 64_000,
+		compat: { imageInput: "assets", sendImageOptInHeader: false },
+	};
+
+	interface ClassifierOutcome {
+		stopReason: ClassifierResult["stopReason"];
+		errorMessage?: string;
+		status?: number | number[];
+	}
+
+	function fakeClassifier(
+		respond: (apiKey: string | undefined, options: ClassifierOptions | undefined) => ClassifierOutcome,
+	): ProviderClassifier & { calls: (string | undefined)[]; headers: (ProviderHeaders | undefined)[] } {
+		const calls: (string | undefined)[] = [];
+		const headers: (ProviderHeaders | undefined)[] = [];
+		return {
+			calls,
+			headers,
+			classify: async (m, _context, opts) => {
+				calls.push(opts?.apiKey);
+				headers.push(opts?.headers);
+				const out = respond(opts?.apiKey, opts);
+				for (const status of [out.status ?? []].flat()) {
+					await opts?.onResponse?.({ status, headers: {} }, m);
+				}
+				return {
+					api: m.api,
+					provider: m.provider,
+					model: m.id,
+					answers:
+						out.stopReason === "stop"
+							? ({ ok: { type: "bool", probability: 0.9 } } as ClassifierResult["answers"])
+							: {},
+					stopReason: out.stopReason,
+					...(out.errorMessage ? { errorMessage: out.errorMessage } : {}),
+					timestamp: Date.now(),
+				};
+			},
+		};
+	}
+
+	const classifyOpts = (apiKey: string, extra: Partial<ClassifierOptions> = {}): ClassifierOptions => ({
+		apiKey,
+		env: fallback,
+		...extra,
+	});
+
+	it("retries on the fallback key when Venice answers HTTP 402 and keeps using it", async () => {
+		const api = fakeClassifier((key) =>
+			key === "key-1"
+				? { stopReason: "error", errorMessage: "402 insufficient balance", status: 402 }
+				: { stopReason: "stop", status: 200 },
+		);
+		const rotated = withClassifierKeyRotation(api);
+
+		const first = await rotated.classify(classifierModel, { state: {}, questions: {} }, classifyOpts("key-1"));
+		const second = await rotated.classify(classifierModel, { state: {}, questions: {} }, classifyOpts("key-1"));
+
+		assert.deepEqual(api.calls, ["key-1", "key-2", "key-2"]);
+		assert.equal(first.stopReason, "stop");
+		assert.equal(second.stopReason, "stop");
+	});
+
+	it("does not rotate on non-402 errors even if the message mentions 402", async () => {
+		const api = fakeClassifier(() => ({
+			stopReason: "error",
+			errorMessage: "400 invalid request (max 402)",
+			status: 400,
+		}));
+		const rotated = withClassifierKeyRotation(api);
+
+		const result = await rotated.classify(classifierModel, { state: {}, questions: {} }, classifyOpts("key-1"));
+		await rotated.classify(classifierModel, { state: {}, questions: {} }, classifyOpts("key-1"));
+
+		assert.deepEqual(api.calls, ["key-1", "key-1"]);
+		assert.equal(result.stopReason, "error");
+	});
+
+	it("still fires the caller's onResponse for every attempt", async () => {
+		const api = fakeClassifier((key) =>
+			key === "key-1"
+				? { stopReason: "error", errorMessage: "402", status: 402 }
+				: { stopReason: "stop", status: 200 },
+		);
+		const statuses: number[] = [];
+
+		await withClassifierKeyRotation(api).classify(
+			classifierModel,
+			{ state: {}, questions: {} },
+			classifyOpts("key-1", {
+				onResponse: (response) => {
+					statuses.push(response.status);
+				},
+			}),
+		);
+
+		assert.deepEqual(statuses, [402, 200]);
+	});
+
+	it("does not rotate when aborted or when Authorization comes from outside the key", async () => {
+		const controller = new AbortController();
+		const abortApi = fakeClassifier((_key, opts) => {
+			if (opts?.apiKey === "key-1") controller.abort();
+			return { stopReason: "aborted", errorMessage: "aborted", status: 402 };
+		});
+		const aborted = await withClassifierKeyRotation(abortApi).classify(
+			classifierModel,
+			{ state: {}, questions: {} },
+			classifyOpts("key-1", { signal: controller.signal }),
+		);
+		assert.deepEqual(abortApi.calls, ["key-1"]);
+		assert.equal(aborted.stopReason, "aborted");
+
+		const authApi = fakeClassifier(() => ({ stopReason: "error", errorMessage: "402", status: 402 }));
+		await withClassifierKeyRotation(authApi).classify(
+			classifierModel,
+			{ state: {}, questions: {} },
+			classifyOpts("key-1", { headers: { Authorization: "Bearer proxy-token" } }),
+		);
+		assert.deepEqual(authApi.calls, ["key-1"]);
+	});
+
+	it("switches an Authorization header matching the primary key and resets when all keys fail", async () => {
+		const api = fakeClassifier(() => ({ stopReason: "error", errorMessage: "402", status: 402 }));
+		const rotated = withClassifierKeyRotation(api);
+
+		await rotated.classify(
+			classifierModel,
+			{ state: {}, questions: {} },
+			classifyOpts("key-1", { headers: { Authorization: "Bearer key-1" } }),
+		);
+		await rotated.classify(
+			classifierModel,
+			{ state: {}, questions: {} },
+			classifyOpts("key-1", { headers: { Authorization: "Bearer key-1" } }),
+		);
+
+		assert.deepEqual(api.calls, ["key-1", "key-2", "key-1", "key-2"]);
+		assert.deepEqual(api.headers, [
+			{ Authorization: "Bearer key-1" },
+			{ Authorization: "Bearer key-2" },
+			{ Authorization: "Bearer key-1" },
+			{ Authorization: "Bearer key-2" },
+		]);
 	});
 });
 

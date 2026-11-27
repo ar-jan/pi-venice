@@ -12,10 +12,11 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-	type Api,
+	type AnyModel,
 	clampThinkingLevel,
+	getModelType,
 	getSupportedThinkingLevels,
-	type Model,
+	isModelType,
 	type Provider,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -33,8 +34,25 @@ function report(ctx: ExtensionCommandContext, message: string, level: NotifyLeve
 	else console.error(message);
 }
 
-function sameModel(a: Model<Api>, b: Model<Api>): boolean {
+function sameModel(a: AnyModel, b: AnyModel): boolean {
 	return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function modelKey(model: AnyModel): string {
+	return `${getModelType(model)}\0${model.id}`;
+}
+
+function modelLabel(model: AnyModel): string {
+	return isModelType(model, "classifier") ? `${model.id} (decision)` : model.id;
+}
+
+function formatModelCount(models: readonly AnyModel[]): string {
+	const chat = models.filter((model) => isModelType(model, "chat")).length;
+	const decision = models.filter((model) => isModelType(model, "classifier")).length;
+	const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+	if (decision === 0) return plural(chat, "model");
+	if (chat === 0) return plural(decision, "decision model");
+	return `${plural(chat, "model")}, ${plural(decision, "decision model")}`;
 }
 
 function listIds(label: string, ids: string[]): string | undefined {
@@ -45,20 +63,20 @@ function listIds(label: string, ids: string[]): string | undefined {
 }
 
 /** A summary of how the provider's catalog changed, one line per kind of change. */
-export function describeCatalogChange(before: readonly Model<Api>[], after: readonly Model<Api>[]): string[] {
-	const count = `${after.length} model${after.length === 1 ? "" : "s"}`;
+export function describeCatalogChange(before: readonly AnyModel[], after: readonly AnyModel[]): string[] {
+	const count = formatModelCount(after);
 	if (before.length === 0) return [`Venice catalog loaded: ${count}.`];
 
-	const previous = new Map(before.map((model) => [model.id, model]));
-	const current = new Set(after.map((model) => model.id));
+	const previous = new Map(before.map((model) => [modelKey(model), model]));
+	const current = new Set(after.map(modelKey));
 	const added: string[] = [];
 	const updated: string[] = [];
 	for (const model of after) {
-		const old = previous.get(model.id);
-		if (!old) added.push(model.id);
-		else if (!sameModel(old, model)) updated.push(model.id);
+		const old = previous.get(modelKey(model));
+		if (!old) added.push(modelLabel(model));
+		else if (!sameModel(old, model)) updated.push(modelLabel(model));
 	}
-	const removed = before.map((model) => model.id).filter((id) => !current.has(id));
+	const removed = before.filter((model) => !current.has(modelKey(model))).map(modelLabel);
 	const byId = (a: string, b: string) => a.localeCompare(b);
 	added.sort(byId);
 	removed.sort(byId);
@@ -147,7 +165,11 @@ export function registerProviderWithRefreshCommand(pi: ExtensionAPI, provider: P
 				return;
 			}
 
-			const before = ctx.modelRegistry.getModelsOfType("chat", providerId);
+			const catalogModels = (): AnyModel[] => [
+				...ctx.modelRegistry.getModelsOfType("chat", providerId),
+				...ctx.modelRegistry.getModelsOfType("classifier", providerId),
+			];
+			const before = catalogModels();
 			const command = { published: false };
 			let result: Awaited<ReturnType<ExtensionCommandContext["modelRegistry"]["refresh"]>>;
 			try {
@@ -178,7 +200,7 @@ export function registerProviderWithRefreshCommand(pi: ExtensionAPI, provider: P
 				return;
 			}
 
-			const lines = describeCatalogChange(before, ctx.modelRegistry.getModelsOfType("chat", providerId));
+			const lines = describeCatalogChange(before, catalogModels());
 			lines.push(...(await applyToCurrentModel(pi, ctx, providerId)));
 			report(ctx, lines.join("\n"), "info");
 		},

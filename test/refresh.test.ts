@@ -2,17 +2,20 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { describe, it } from "node:test";
 import {
+	type AnyModel,
 	type Api,
 	clampThinkingLevel,
+	type ClassifierModel,
 	createModels,
 	InMemoryCredentialStore,
 	InMemoryModelsStore,
+	isModelType,
 	type Model,
 	type ModelsRefreshOptions,
 	type ModelThinkingLevel,
 	type Provider,
 } from "@earendil-works/pi-ai";
-import registerVenice, { toPiModel } from "../extensions/venice/index.ts";
+import registerVenice, { toPiClassifierModel, toPiModel } from "../extensions/venice/index.ts";
 import { describeCatalogChange, registerProviderWithRefreshCommand } from "../extensions/venice/refresh.ts";
 
 function model(id: string, options: { efforts?: string[]; input?: number } = {}): Model<Api> {
@@ -29,6 +32,21 @@ function model(id: string, options: { efforts?: string[]; input?: number } = {})
 					: {}),
 			},
 			pricing: { input: { usd: options.input ?? 1 }, output: { usd: 2 } },
+		},
+	});
+	assert.ok(result);
+	return result;
+}
+
+function classifier(id: string, input = 0.05): ClassifierModel<"typesafe-system-one"> {
+	const result = toPiClassifierModel({
+		id,
+		type: "decision",
+		model_spec: {
+			name: id,
+			privacy: "private",
+			maxTotalTokens: 32_768,
+			pricing: { input: { usd: input }, output: { usd: 0.05 } },
 		},
 	});
 	assert.ok(result);
@@ -53,8 +71,8 @@ interface Harness {
  * pi: selecting a model applies `configuredLevel` and every level is clamped to the selected model.
  */
 function harness(options: {
-	cached: Model<Api>[];
-	fetched?: Model<Api>[];
+	cached: AnyModel[];
+	fetched?: AnyModel[];
 	current?: Model<Api>;
 	level?: ModelThinkingLevel;
 	configuredLevel?: ModelThinkingLevel;
@@ -112,11 +130,12 @@ function harness(options: {
 		},
 		modelRegistry: {
 			getProviderAuth: async () => ("auth" in options ? options.auth : { auth: { apiKey: "key" } }),
-			getModelsOfType: (type: string, provider: string) => {
-				assert.deepEqual([type, provider], ["chat", "venice"]);
-				return catalog;
+			getModelsOfType: (type: "chat" | "classifier", provider: string) => {
+				assert.equal(provider, "venice");
+				return catalog.filter((entry) => isModelType(entry, type));
 			},
-			find: (provider: string, id: string) => catalog.find((entry) => entry.provider === provider && entry.id === id),
+			find: (provider: string, id: string) =>
+				catalog.find((entry) => isModelType(entry, "chat") && entry.provider === provider && entry.id === id),
 			refresh: async (refreshOptions: ModelsRefreshOptions) => {
 				refreshCalls.push(refreshOptions);
 				if (options.refresh) return options.refresh();
@@ -169,6 +188,19 @@ describe("describeCatalogChange", () => {
 		const added = Array.from({ length: 12 }, (_, index) => model(`m${String(index).padStart(2, "0")}`));
 		const lines = describeCatalogChange([model("keep")], [model("keep"), ...added]);
 		assert.equal(lines[1], "Added: m00, m01, m02, m03, m04, m05, m06, m07, m08, m09, and 2 more");
+	});
+
+	it("reports classifier additions, removals, and updates alongside chat models", () => {
+		const lines = describeCatalogChange(
+			[model("chat-1"), classifier("old-clf"), classifier("jev-latest", 0.04)],
+			[model("chat-1"), classifier("clef-api"), classifier("jev-latest", 0.05)],
+		);
+		assert.deepEqual(lines, [
+			"Venice catalog refreshed: 1 model, 2 decision models (1 added, 1 removed, 1 updated).",
+			"Added: clef-api (decision)",
+			"Removed: old-clf (decision)",
+			"Updated: jev-latest (decision)",
+		]);
 	});
 });
 
@@ -331,6 +363,24 @@ describe("/venice-refresh-models", () => {
 		await test.run();
 		assert.equal(test.setModelCalls.length, 0);
 		assert.match(test.notifications[0]!.message, /current model gone is no longer offered/);
+	});
+
+	it("reports classifier changes in /venice-refresh-models", async () => {
+		const test = harness({
+			cached: [model("a"), classifier("jev-latest", 0.04)],
+			fetched: [model("a"), classifier("jev-latest", 0.05), classifier("clef-api")],
+		});
+		await test.run();
+		assert.deepEqual(test.notifications, [
+			{
+				message: [
+					"Venice catalog refreshed: 1 model, 2 decision models (1 added, 1 updated).",
+					"Added: clef-api (decision)",
+					"Updated: jev-latest (decision)",
+				].join("\n"),
+				level: "info",
+			},
+		]);
 	});
 
 	it("writes to stderr without a UI", async (t) => {
