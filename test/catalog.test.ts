@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { getSupportedThinkingLevels, InMemoryCredentialStore, InMemoryModelsStore, type Provider } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import registerVenice, { toPiClassifierModel, toPiModel } from "../extensions/venice/index.ts";
+import registerVenice, {
+	createVeniceProvider,
+	DECISION_MODELS_TIMEOUT_MS,
+	toPiClassifierModel,
+	toPiModel,
+} from "../extensions/venice/index.ts";
 
 type Capabilities = Record<string, unknown>;
 
@@ -147,6 +152,192 @@ describe("catalog refresh", () => {
 		assert.equal(result.errors.size, 0);
 		assert.equal(registry.find("venice", "grok-4-20")?.id, "grok-4-20");
 		assert.deepEqual(registry.getModelsOfType("classifier", "venice"), []);
+	});
+
+	it("publishes and persists fresh chat models when the decision endpoint stalls within Pi's 15s deadline", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const modelsStore = new InMemoryModelsStore();
+		const runtime = await ModelRuntime.create({ credentials, modelsStore, modelsPath: null });
+		const registry = new ModelRegistry(runtime);
+		const initialRefresh = t.mock.method(runtime, "refresh");
+		registerVenice({
+			on() {},
+			registerCommand() {},
+			registerProvider(provider: Provider) {
+				registry.registerProvider(provider);
+			},
+		} as never);
+		await initialRefresh.mock.calls[0]?.result;
+
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		let decisionStarted!: () => void;
+		const decisionPending = new Promise<void>((resolve) => {
+			decisionStarted = resolve;
+		});
+		let decisionAborted = false;
+		t.mock.method(globalThis, "fetch", (input: string | URL | Request, init?: RequestInit) => {
+			if (String(input).includes("type=decision")) {
+				decisionStarted();
+				return new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener(
+						"abort",
+						() => {
+							decisionAborted = true;
+							reject(init.signal!.reason ?? new DOMException("Aborted", "AbortError"));
+						},
+						{ once: true },
+					);
+				});
+			}
+			return Promise.resolve(Response.json({ data: [veniceModel()] }));
+		});
+
+		// Mirror Pi's interactive refresh: the 15s caller deadline starts before refresh() runs.
+		const interactive = new AbortController();
+		const interactiveTimeout = setTimeout(() => interactive.abort(new DOMException("Timed out", "TimeoutError")), 15_000);
+		t.after(() => clearTimeout(interactiveTimeout));
+
+		const refreshPromise = registry.refresh({ providers: ["venice"], allowNetwork: true, signal: interactive.signal });
+		await decisionPending;
+		// Advance to the decision timeout — still well before the 15s interactive deadline.
+		assert.ok(DECISION_MODELS_TIMEOUT_MS < 15_000);
+		t.mock.timers.tick(DECISION_MODELS_TIMEOUT_MS);
+
+		const result = await refreshPromise;
+		assert.equal(interactive.signal.aborted, false);
+		assert.equal(decisionAborted, true);
+		assert.equal(result.aborted, false);
+		assert.equal(result.errors.size, 0);
+		assert.equal(registry.find("venice", "grok-4-20")?.id, "grok-4-20");
+		const persisted = await modelsStore.read("venice");
+		assert.deepEqual(
+			persisted?.models.map((entry) => entry.id),
+			["grok-4-20"],
+		);
+	});
+
+	it("falls back to cached classifiers and persists fresh chats when the decision endpoint stalls", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const modelsStore = new InMemoryModelsStore();
+		const cachedDecision = toPiClassifierModel(veniceDecisionModel("jev-latest") as never)!;
+		await modelsStore.write("venice", { models: [cachedDecision], checkedAt: 1 });
+		const runtime = await ModelRuntime.create({ credentials, modelsStore, modelsPath: null });
+		const registry = new ModelRegistry(runtime);
+		const initialRefresh = t.mock.method(runtime, "refresh");
+		registerVenice({
+			on() {},
+			registerCommand() {},
+			registerProvider(provider: Provider) {
+				registry.registerProvider(provider);
+			},
+		} as never);
+		await initialRefresh.mock.calls[0]?.result;
+
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		let decisionStarted!: () => void;
+		const decisionPending = new Promise<void>((resolve) => {
+			decisionStarted = resolve;
+		});
+		t.mock.method(globalThis, "fetch", (input: string | URL | Request, init?: RequestInit) => {
+			if (String(input).includes("type=decision")) {
+				decisionStarted();
+				return new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener(
+						"abort",
+						() => reject(init.signal!.reason ?? new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+				});
+			}
+			return Promise.resolve(Response.json({ data: [veniceModel()] }));
+		});
+
+		const interactive = new AbortController();
+		const interactiveTimeout = setTimeout(() => interactive.abort(), 15_000);
+		t.after(() => clearTimeout(interactiveTimeout));
+
+		const refreshPromise = registry.refresh({ providers: ["venice"], allowNetwork: true, signal: interactive.signal });
+		await decisionPending;
+		t.mock.timers.tick(DECISION_MODELS_TIMEOUT_MS);
+
+		const result = await refreshPromise;
+		assert.equal(result.aborted, false);
+		assert.equal(result.errors.size, 0);
+		assert.equal(registry.find("venice", "grok-4-20")?.id, "grok-4-20");
+		assert.equal(registry.findOfType("classifier", "venice", "jev-latest")?.id, "jev-latest");
+		const persisted = await modelsStore.read("venice");
+		assert.deepEqual(
+			persisted?.models.map((entry) => entry.id),
+			["grok-4-20", "jev-latest"],
+		);
+	});
+
+	it("preserves caller cancellation while waiting on a stalled decision endpoint", async (t) => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const modelsStore = new InMemoryModelsStore();
+		const runtime = await ModelRuntime.create({ credentials, modelsStore, modelsPath: null });
+		const registry = new ModelRegistry(runtime);
+		const initialRefresh = t.mock.method(runtime, "refresh");
+		registerVenice({
+			on() {},
+			registerCommand() {},
+			registerProvider(provider: Provider) {
+				registry.registerProvider(provider);
+			},
+		} as never);
+		await initialRefresh.mock.calls[0]?.result;
+
+		let decisionStarted!: () => void;
+		const decisionPending = new Promise<void>((resolve) => {
+			decisionStarted = resolve;
+		});
+		t.mock.method(globalThis, "fetch", (input: string | URL | Request, init?: RequestInit) => {
+			if (String(input).includes("type=decision")) {
+				decisionStarted();
+				return new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener(
+						"abort",
+						() => reject(init.signal!.reason ?? new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+				});
+			}
+			return Promise.resolve(Response.json({ data: [veniceModel()] }));
+		});
+
+		const caller = new AbortController();
+		const refreshPromise = registry.refresh({ providers: ["venice"], allowNetwork: true, signal: caller.signal });
+		await decisionPending;
+		caller.abort(new DOMException("Cancelled by caller", "AbortError"));
+
+		const result = await refreshPromise;
+		assert.equal(result.aborted, true);
+		assert.equal(registry.find("venice", "grok-4-20"), undefined);
+		assert.equal(await modelsStore.read("venice"), undefined);
+	});
+
+	it("excludes cached classifiers after a cache-only restore when TypeSafe is unavailable", async () => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("venice", async () => ({ type: "api_key", key: "test-key" }));
+		const modelsStore = new InMemoryModelsStore();
+		const cachedChat = toPiModel(veniceModel() as never)!;
+		const cachedDecision = toPiClassifierModel(veniceDecisionModel("jev-latest") as never)!;
+		await modelsStore.write("venice", { models: [cachedChat, cachedDecision], checkedAt: 1 });
+
+		const runtime = await ModelRuntime.create({ credentials, modelsStore, modelsPath: null });
+		const registry = new ModelRegistry(runtime);
+		registry.registerProvider(createVeniceProvider({ systemOne: undefined }));
+
+		const result = await registry.refresh({ providers: ["venice"], allowNetwork: false });
+
+		assert.equal(result.errors.size, 0);
+		assert.deepEqual(registry.getModelsOfType("classifier", "venice"), []);
+		assert.equal(registry.findOfType("classifier", "venice", "jev-latest"), undefined);
+		assert.deepEqual(await registry.getAvailableOfType("classifier", "venice"), []);
+		assert.equal(registry.find("venice", "grok-4-20")?.id, "grok-4-20");
 	});
 });
 

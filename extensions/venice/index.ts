@@ -28,6 +28,8 @@ import {
 	createProvider,
 	isModelType,
 	type Model,
+	type Provider,
+	type ProviderClassifier,
 	type ProviderStreams,
 	type RefreshModelsContext,
 	type SystemOneCompat,
@@ -58,6 +60,11 @@ import { VENICE_MAX_IMAGES_PER_REQUEST, withVeniceRequestDefaults } from "./requ
 const PROVIDER_ID = "venice";
 const BASE_URL = "https://api.venice.ai/api/v1";
 const MODELS_TIMEOUT_MS = 15_000;
+/**
+ * Shorter timeout for the optional beta decision catalog so a stalled `/models?type=decision`
+ * request falls back to cached classifiers well before Pi's 15-second interactive refresh deadline.
+ */
+export const DECISION_MODELS_TIMEOUT_MS = 5_000;
 
 // =============================================================================
 // Venice catalog
@@ -368,15 +375,29 @@ export function toPiClassifierModel(model: VeniceModel): ClassifierModel<"typesa
 	};
 }
 
-async function fetchModelList(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<VeniceModel[]> {
-	const response = await fetch(url, {
-		headers,
-		signal: AbortSignal.any([signal, AbortSignal.timeout(MODELS_TIMEOUT_MS)]),
-	});
-	if (!response.ok) throw new Error(`Venice model list request failed: ${response.status}`);
-	const body = (await response.json()) as { data?: unknown };
-	if (!Array.isArray(body.data)) throw new Error("Invalid Venice model list response");
-	return body.data as VeniceModel[];
+async function fetchModelList(
+	url: string,
+	headers: Record<string, string>,
+	signal: AbortSignal,
+	timeoutMs: number,
+): Promise<VeniceModel[]> {
+	const timeout = new AbortController();
+	const timer = setTimeout(() => {
+		timeout.abort(new DOMException(`The operation timed out after ${timeoutMs}ms`, "TimeoutError"));
+	}, timeoutMs);
+	timer.unref?.();
+	try {
+		const response = await fetch(url, {
+			headers,
+			signal: AbortSignal.any([signal, timeout.signal]),
+		});
+		if (!response.ok) throw new Error(`Venice model list request failed: ${response.status}`);
+		const body = (await response.json()) as { data?: unknown };
+		if (!Array.isArray(body.data)) throw new Error("Invalid Venice model list response");
+		return body.data as VeniceModel[];
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function cachedClassifiers(stored: RefreshModelsContext["stored"]): ClassifierModel<"typesafe-system-one">[] {
@@ -389,12 +410,13 @@ function cachedClassifiers(stored: RefreshModelsContext["stored"]): ClassifierMo
 async function fetchVeniceModels(
 	{ baseUrl = BASE_URL, credential, signal, stored }: RefreshModelsContext,
 	includeDecisions: boolean,
+	decisionTimeoutMs = DECISION_MODELS_TIMEOUT_MS,
 ): Promise<(Model<"openai-completions"> | ClassifierModel<"typesafe-system-one">)[]> {
 	const headers: Record<string, string> = { accept: "application/json" };
 	if (credential?.type === "api_key" && credential.key) headers.authorization = `Bearer ${credential.key}`;
 	const root = baseUrl.replace(/\/+$/, "");
 
-	const textPromise = fetchModelList(`${root}/models?type=text`, headers, signal).then((entries) =>
+	const textPromise = fetchModelList(`${root}/models?type=text`, headers, signal, MODELS_TIMEOUT_MS).then((entries) =>
 		entries
 			.map(toPiModel)
 			.filter((model): model is Model<"openai-completions"> => model !== undefined)
@@ -402,11 +424,17 @@ async function fetchVeniceModels(
 	);
 	if (!includeDecisions) return textPromise;
 
-	// Decision models are beta: a failing decision-list request must not fail the text catalog
-	// refresh. Because `createProvider` replaces the whole persisted catalog with `fetchModels`'s
-	// return value, keep previously cached classifiers on transient failures rather than wiping
-	// them out of `models-store.json`.
-	const decisionPromise = fetchModelList(`${root}/models?type=decision`, headers, signal)
+	// Decision models are beta: a failing or stalled decision-list request must not fail the text
+	// catalog refresh or hold it past Pi's 15-second interactive deadline. Because `createProvider`
+	// replaces the whole persisted catalog with `fetchModels`'s return value, keep previously
+	// cached classifiers on non-abort failures rather than wiping them out of `models-store.json`.
+	const decisionAbort = new AbortController();
+	const decisionPromise = fetchModelList(
+		`${root}/models?type=decision`,
+		headers,
+		AbortSignal.any([signal, decisionAbort.signal]),
+		decisionTimeoutMs,
+	)
 		.then((entries) =>
 			entries
 				.map(toPiClassifierModel)
@@ -418,8 +446,12 @@ async function fetchVeniceModels(
 			return cachedClassifiers(stored);
 		});
 
-	const [chatModels, decisionModels] = await Promise.all([textPromise, decisionPromise]);
-	return [...chatModels, ...decisionModels];
+	try {
+		const [chatModels, decisionModels] = await Promise.all([textPromise, decisionPromise]);
+		return [...chatModels, ...decisionModels];
+	} finally {
+		decisionAbort.abort();
+	}
 }
 
 // =============================================================================
@@ -434,9 +466,52 @@ export function veniceApi(keyring: Keyring): ProviderStreams {
 	return withKeyRotation(withVeniceRequestDefaults(openAICompletionsApi(), clampThinkingLevel), keyring);
 }
 
+export interface VeniceProviderOptions {
+	keyring?: Keyring;
+	getRegistry?: () => ExtensionContext["modelRegistry"] | undefined;
+	/** Injected System One classifier; defaults to `borrowedSystemOne()`. */
+	systemOne?: ProviderClassifier | undefined;
+	/** Timeout for the optional decision catalog request; defaults to `DECISION_MODELS_TIMEOUT_MS`. */
+	decisionTimeoutMs?: number;
+}
+
+export function createVeniceProvider(options: VeniceProviderOptions = {}): Provider {
+	const keyring = options.keyring ?? new Keyring();
+	const getRegistry = options.getRegistry ?? (() => undefined);
+	const systemOne = "systemOne" in options ? options.systemOne : borrowedSystemOne();
+	const decisionTimeoutMs = options.decisionTimeoutMs ?? DECISION_MODELS_TIMEOUT_MS;
+
+	const base = createProvider({
+		id: PROVIDER_ID,
+		name: "Venice AI",
+		baseUrl: BASE_URL,
+		auth: { apiKey: veniceApiKeyAuth(getRegistry) },
+		models: [],
+		fetchModels: (context) => fetchVeniceModels(context, systemOne !== undefined, decisionTimeoutMs),
+		api: veniceApi(keyring),
+		...(systemOne
+			? { classifiers: { "typesafe-system-one": withClassifierKeyRotation(systemOne, keyring) } }
+			: {}),
+	});
+
+	if (systemOne) return base;
+
+	// Without a classifier implementation, strip cached classifiers before `createProvider` restores
+	// `models-store.json` so `getModelsOfType`, `findOfType`, and `getAvailableOfType` all exclude
+	// them while cached chat models stay usable.
+	return {
+		...base,
+		refreshModels(context) {
+			const stored = context.stored
+				? { ...context.stored, models: context.stored.models.filter((model) => !isModelType(model, "classifier")) }
+				: undefined;
+			return base.refreshModels!({ ...context, stored });
+		},
+	};
+}
+
 export default function (pi: ExtensionAPI) {
 	const keyring = new Keyring(loadPreferredKeyHash());
-	const systemOne = borrowedSystemOne();
 
 	// The registry belongs to the active session, which can change on reload or session replacement.
 	let registry: ExtensionContext["modelRegistry"] | undefined;
@@ -447,24 +522,7 @@ export default function (pi: ExtensionAPI) {
 		registry = undefined;
 	});
 
-	registerProviderWithRefreshCommand(
-		pi,
-		createProvider({
-			id: PROVIDER_ID,
-			name: "Venice AI",
-			baseUrl: BASE_URL,
-			auth: { apiKey: veniceApiKeyAuth(() => registry) },
-			models: [],
-			fetchModels: (context) => fetchVeniceModels(context, systemOne !== undefined),
-			...(systemOne
-				? {}
-				: { filterAllModels: (models) => models.filter((model) => !isModelType(model, "classifier")) }),
-			api: veniceApi(keyring),
-			...(systemOne
-				? { classifiers: { "typesafe-system-one": withClassifierKeyRotation(systemOne, keyring) } }
-				: {}),
-		}),
-	);
+	registerProviderWithRefreshCommand(pi, createVeniceProvider({ keyring, getRegistry: () => registry }));
 
 	pi.registerCommand("venice-key", {
 		description: "Select the active Venice API key",
